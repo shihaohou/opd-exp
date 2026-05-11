@@ -1,0 +1,78 @@
+# E0 Image-vs-Null Teacher Delta Diagnostic — default config
+#
+# This file is the single source of truth for paths, models, datasets, and
+# scoring hyperparameters used by experiments/E0_image_null_delta/src/dual_forward.py.
+# Treat fields as overridable via CLI flags where helpful, but the defaults
+# below should reproduce the canonical E0-mini run.
+
+seed: 42
+
+paths:
+  # Root containing model checkpoints on the remote box
+  models_root: /home/web_server/antispam/project/houshihao/models
+  # Root containing arrow-format datasets (HF Dataset.save_to_disk output)
+  datasets_root: /home/web_server/antispam/project/houshihao/datasets
+  # Where shard jsonls and aggregated CSV land. Relative to repo root.
+  output_root: experiments/E0_image_null_delta/results
+
+models:
+  teacher32b:
+    path_relative: Qwen2.5-VL-32B-Instruct
+    dtype: bfloat16
+    attn_impl: flash_attention_2
+    # 'single' = pin to one CUDA device (chosen by CUDA_VISIBLE_DEVICES);
+    # 'auto'   = let HF spread the model across all visible devices.
+    device_map: single
+
+  teacher72b:
+    path_relative: Qwen2.5-VL-72B-Instruct
+    dtype: bfloat16
+    attn_impl: flash_attention_2
+    device_map: auto
+
+  student7b:
+    path_relative: Qwen2.5-VL-7B-Instruct
+    dtype: bfloat16
+    attn_impl: flash_attention_2
+    device_map: single
+
+datasets:
+  vlmbias_main:
+    loader: vlmbias
+    path_relative: VLMBias
+    subset: main
+    n_samples: null            # null = use all 2780 rows
+
+  pope_adversarial:
+    loader: pope
+    path_relative: POPE-adversarial
+    n_samples: 1000
+
+  mathvista_mini:
+    loader: mathvista
+    path_relative: MathVista-mini
+    n_samples: 500
+
+# Which null condition(s) to record. Start with [black] only; add image_drop
+# once we verify the Qwen2.5-VL processor accepts no-image messages cleanly.
+null_modes:
+  - black
+
+forced_scoring:
+  # Truncate distributions to the union of top-K under each condition before
+  # computing KL. Keeps noise from the tail under control.
+  top_k: 50
+
+generation:
+  # Greedy throughout E0. No sampling.
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+
+# Forced-scoring of fixed answer options (for metric 3 on VLMBias and
+# answer-level visual gain on POPE).
+option_scoring:
+  enabled: true
+  # When True, also compute log P(option) under each condition for the
+  # ground_truth and expected_bias strings (VLMBias), and for "yes"/"no" (POPE).
