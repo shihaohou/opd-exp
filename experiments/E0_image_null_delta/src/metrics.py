@@ -413,6 +413,25 @@ def main():
             "m2_mean_delta": metric_2_mean_delta_by_correctness(mathvista_records),
         }
 
+    # Per-topic disaggregation for VLMBias. Without this, the "Optical Illusion"
+    # subset (where image is adversarial signal — VLMs fall for the illusion)
+    # drags metric 2/3 toward negative on the global average, which would
+    # obscure the positive signal expected on non-illusion topics
+    # (counting, identification, etc.).
+    vlmbias_topics: dict[str, list[dict]] = defaultdict(list)
+    for r in vlmbias_records:
+        topic = (r.get("extras") or {}).get("topic")
+        if topic is not None:
+            vlmbias_topics[topic].append(r)
+    metrics["vlmbias_by_topic"] = {
+        topic: {
+            "m1_acc": metric_1_accuracy(recs),
+            "m2_mean_delta": metric_2_mean_delta_by_correctness(recs),
+            "m3_visual_gain": metric_3_visual_gain(recs),
+        }
+        for topic, recs in sorted(vlmbias_topics.items())
+    }
+
     # Top-delta tokens — one bucket per dataset, dumped to JSON for hand-inspection.
     top_tokens = {
         "vlmbias": metric_4_top_delta_tokens(vlmbias_records),
@@ -424,9 +443,17 @@ def main():
         json.dump(top_tokens, f, indent=2, ensure_ascii=False)
     print(f"[metrics] wrote {out_tokens}")
 
-    # Flat CSV summary.
+    # Flat CSV summary. One row per group; per-topic VLMBias gets one row per topic.
     rows: list[dict[str, Any]] = []
     for ds_key, ds_metrics in metrics.items():
+        if ds_key == "vlmbias_by_topic":
+            for topic, topic_metrics in ds_metrics.items():
+                flat = {"group": f"vlmbias_main / {topic}"}
+                for mkey, mval in topic_metrics.items():
+                    for sub, v in mval.items():
+                        flat[f"{mkey}.{sub}"] = v
+                rows.append(flat)
+            continue
         flat = {"group": ds_key}
         for mkey, mval in ds_metrics.items():
             for sub, v in mval.items():

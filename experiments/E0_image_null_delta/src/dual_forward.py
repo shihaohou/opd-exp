@@ -73,7 +73,7 @@ def load_model(model_cfg: dict, models_root: str):
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation=model_cfg["attn_impl"],
         device_map=device_map,
     )
