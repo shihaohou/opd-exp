@@ -244,33 +244,97 @@ def metric_4_top_delta_tokens_by_topic(
     }
 
 
+def _extract_answer(record: dict) -> str:
+    """
+    Best-effort short-form answer extraction from a record's `ans_T_I`.
+
+    Mirrors the parsing logic in dual_forward.parse_correctness so same-wrong
+    matching is not fooled by CoT preamble. Returns a lowercased, stripped
+    token (e.g., "yes", "no", "5", "{no}") or the full lowered string if no
+    pattern is found.
+    """
+    import re
+    text = (record.get("ans_T_I") or "").strip()
+    if not text:
+        return ""
+    ds = record.get("dataset") or ""
+    rt_low = text.lower()
+
+    if ds.startswith("vlmbias"):
+        # First {...} pattern wins; common forms are {Yes} / {No} / {5}.
+        m = re.search(r"\{([^}]+)\}", text)
+        if m:
+            return m.group(1).strip().lower()
+        # Fallback: last short token.
+        toks = re.findall(r"[\w\-]+", text)
+        return toks[-1].lower() if toks else rt_low
+
+    if ds == "pope_adversarial":
+        first_yes = rt_low.find("yes")
+        first_no = rt_low.find("no")
+        if first_yes == -1 and first_no == -1:
+            return rt_low
+        if first_yes == -1:
+            return "no"
+        if first_no == -1:
+            return "yes"
+        return "yes" if first_yes < first_no else "no"
+
+    # mathvista or unknown: just use the lowered string
+    return rt_low
+
+
 def metric_5a_student_teacher_overlap(
     teacher_records: list[dict],
     student_records: list[dict],
 ) -> dict[str, Any]:
     """
-    Among VLMBias samples where the teacher is wrong AND the student is wrong,
-    what fraction predicted the SAME answer string?
+    Among samples where BOTH teacher and student are wrong, what fraction
+    predicted the SAME wrong answer string? Also reports answer-space size
+    and a chance baseline so the rate can be interpreted.
 
-    We pair on sample_id (assumes student and teacher are both run on the same
-    samples; mismatched sample sets are silently dropped).
+    Chance baseline reasoning:
+      If both pick uniformly from (k - 1) wrong answers where k is the
+      answer-space size, P(same | both wrong) = 1 / (k - 1).
+      For binary tasks (k = 2) this is 1.0 — overlap is mechanically forced
+      to 100% and the metric carries no shared-bias signal.
     """
     by_id_s = {r["sample_id"]: r for r in student_records}
     n_both_wrong = 0
     n_same_wrong = 0
+    gold_set: set[str] = set()
     for tr in teacher_records:
         sr = by_id_s.get(tr["sample_id"])
         if sr is None:
             continue
+        if tr.get("gold") is not None:
+            gold_set.add(str(tr["gold"]).strip().lower())
         if tr["correct_I"] or sr["correct_I"]:
             continue
         n_both_wrong += 1
-        if tr["ans_T_I"].strip().lower() == sr["ans_T_I"].strip().lower():
+        if _extract_answer(tr) == _extract_answer(sr):
             n_same_wrong += 1
+
+    answer_space_size = len(gold_set)
+    if answer_space_size >= 2:
+        chance_baseline = 1.0 / (answer_space_size - 1)
+    else:
+        chance_baseline = None  # degenerate
+
+    overlap_rate = (n_same_wrong / n_both_wrong) if n_both_wrong else None
+    excess_over_chance = (
+        overlap_rate - chance_baseline
+        if overlap_rate is not None and chance_baseline is not None
+        else None
+    )
+
     return {
         "n_both_wrong": n_both_wrong,
         "n_same_wrong": n_same_wrong,
-        "overlap_rate": (n_same_wrong / n_both_wrong) if n_both_wrong else None,
+        "overlap_rate": overlap_rate,
+        "answer_space_size": answer_space_size,
+        "chance_baseline": chance_baseline,
+        "excess_over_chance": excess_over_chance,
     }
 
 
@@ -480,10 +544,59 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
     if m5a.get("n_both_wrong"):
         body.append("## Student/teacher overlap (metric 5a)")
         body.append("")
-        body.append(f"- both wrong on VLMBias: n={m5a['n_both_wrong']}, "
-                    f"same wrong answer: n={m5a['n_same_wrong']} "
-                    f"(rate={_fmt(m5a.get('overlap_rate'), '.3f')}).")
+        body.append("**Important framing**: 7B student and 32B teacher are "
+                    "both *independently pretrained* members of the Qwen2.5-VL "
+                    "family — neither was distilled from the other. The "
+                    "metric below measures **baseline shared prior between "
+                    "two same-family models**, not distillation-induced "
+                    "inheritance. Whether vanilla OPD raises this rate or "
+                    "Delta-OPD keeps it stable is the actual question E1 "
+                    "answers; this E0 number is the floor.")
         body.append("")
+        body.append(f"- Global: both wrong n={m5a['n_both_wrong']} "
+                    f"({m5a['n_both_wrong'] / v['m1_acc']['n'] * 100:.1f}% of VLMBias `main`), "
+                    f"same wrong answer n={m5a['n_same_wrong']}, "
+                    f"rate={_fmt(m5a.get('overlap_rate'), '.3f')}.")
+        body.append("")
+        body.append("Headline overlap rate is partly mechanical — binary-answer "
+                    "topics (Optical Illusion: gold ∈ {Yes, No}) are forced to "
+                    "100% same-wrong when both miss, since there's only one "
+                    "wrong option to land on. The recognition topics with "
+                    "larger answer space are where the signal is real.")
+        body.append("")
+
+        # Per-topic 5a table sorted by chance-corrected excess (descending).
+        by_topic = metrics.get("vlmbias_by_topic", {})
+        rows: list[tuple] = []
+        for topic, tm in by_topic.items():
+            tm5 = tm.get("m5a_student_teacher_overlap", {})
+            if not tm5 or not tm5.get("n_both_wrong"):
+                continue
+            rows.append((
+                tm5.get("excess_over_chance") or 0.0,
+                topic,
+                tm5["n_both_wrong"], tm5["n_same_wrong"],
+                tm5.get("overlap_rate"),
+                tm5.get("answer_space_size"),
+                tm5.get("chance_baseline"),
+                tm5.get("excess_over_chance"),
+            ))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        if rows:
+            body.append("Per-topic breakdown (sorted by excess over chance baseline). "
+                        "**`excess_over_chance` is the real signal** — how much "
+                        "more same-wrong-prone these two models are than two "
+                        "uniformly-random independent guessers would be on this "
+                        "topic.")
+            body.append("")
+            body.append("| Topic | n_both_wrong | n_same_wrong | rate | answer_space | chance | **excess** |")
+            body.append("|---|---:|---:|---:|---:|---:|---:|")
+            for _, topic, nb, ns, rate, asz, chb, exc in rows:
+                body.append(
+                    f"| {topic} | {nb} | {ns} | {_fmt(rate, '.3f')} | "
+                    f"{asz} | {_fmt(chb, '.3f')} | **{_fmt(exc, '+.3f')}** |"
+                )
+            body.append("")
 
     # Caveats / known issues.
     body.append("## Caveats (apply E0-wide)")
@@ -509,24 +622,43 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
     # E1 implications.
     body.append("## Implications for E1 training")
     body.append("")
-    body.append("- **Do not run raw Delta-OPD as the primary recipe.** On the "
-                "VLMBias adversarial topics, raw delta-weighting would amplify "
-                "the teacher's pattern-matching errors.")
-    body.append("- **Primary E1 recipe: Correct-Filtered Delta-OPD.** Only apply "
-                "delta weighting on tokens from trajectories where the teacher "
+    body.append("- **Primary E1 recipe: Filtered Delta-OPD.** Apply delta "
+                "weighting only on tokens from trajectories where the teacher "
                 "is correct (or passes a verifier). Raw Delta-OPD becomes a "
-                "*negative control* — the ablation showing image-influence "
-                "alone is insufficient.")
-    body.append("- **Training data composition** should favor verifier-friendly "
-                "general VQA (e.g. ViRL39K, LLaVA-CoT-100K subsamples) and "
-                "include some adversarial recognition examples so the student "
-                "has exposure to the failure mode at train time.")
-    body.append("- **E1 evaluation must include per-topic VLMBias breakdown.** "
-                "Aggregating across topics will hide whether Delta-OPD helps "
-                "Optical Illusion but hurts Animals/Flags/Logos.")
-    body.append("- **Student-side gain_margin** is the cleanest metric for "
-                "checking whether the student inherited the teacher's "
-                "wrong-direction visual influence on VLMBias.")
+                "*negative-control* ablation — the row in the table that "
+                "shows \"image influence alone is insufficient\".")
+    body.append("- **Min E1 config matrix (4 runs)**: SFT (off-policy teacher "
+                "imitation) / Vanilla OPD / Raw Delta-OPD / Filtered Delta-OPD. "
+                "If compute-constrained, the minimum is Vanilla OPD + Raw "
+                "Delta-OPD + Filtered Delta-OPD.")
+    body.append("- **Teacher-Error Inheritance (TEI) is the central success "
+                "metric for E1**: take this run's teacher-wrong subset as a "
+                "*frozen* held-out evaluation set, then on trained students "
+                "compute (a) Acc_S | T_wrong, (b) TEI rate = P(S_after = "
+                "T_wrong_answer | T_wrong), (c) Escape rate = P(S_after = GT "
+                "| T_wrong AND S_base = T_wrong_answer). Filtered Delta-OPD "
+                "should improve (a)+(c) and reduce (b) vs Vanilla OPD.")
+    body.append("- **Training data composition** should mix verifier-friendly "
+                "general VQA (e.g. ViRL39K, LLaVA-CoT-100K — ~50%) with "
+                "object-presence / hallucination data (~20%) and adversarial "
+                "recognition-modification examples (~30%) so the student has "
+                "exposure to the failure mode at train time. **Treat these "
+                "ratios as starting points, not protocol.**")
+    body.append("- **Filtered Delta-OPD cannot fix Animals alone** "
+                "(teacher acc=0/546 → no positive trajectories to weight). "
+                "Must combine with ground-truth CE on final-answer tokens, "
+                "OR a regenerate-and-filter pipeline (teacher re-answers with "
+                "explicit counting/grounding cue, then filter).")
+    body.append("- **E1 evaluation must report VLMBias per-topic**, separating "
+                "Optical Illusion from Recognition Aggregate (Animals + Chess + "
+                "Flags + Game Boards + Logos + Patterned Grid). The two have "
+                "opposite-sign signals here — aggregating will hide gains/losses.")
+    body.append("- **Pending E0.x additions** (not yet computed, deferred to "
+                "next aggregate run): length-normalized option scoring (the "
+                "current `gain_margin` has a token-count bias when "
+                "ground_truth and expected_bias tokenize differently); "
+                "PPL_S(teacher_wrong_response | x, I) as a distribution-level "
+                "overlap proxy.")
     body.append("")
     body.append("---")
     body.append("")
@@ -632,11 +764,20 @@ def main():
         topic = (r.get("extras") or {}).get("topic")
         if topic is not None:
             vlmbias_topics[topic].append(r)
+    # Build a student-topic index too, so we can compute 5a per topic.
+    student_vlmbias_by_id_topic: dict[str, list[dict]] = defaultdict(list)
+    for sr in student_vlmbias:
+        topic = (sr.get("extras") or {}).get("topic")
+        if topic is not None:
+            student_vlmbias_by_id_topic[topic].append(sr)
     metrics["vlmbias_by_topic"] = {
         topic: {
             "m1_acc": metric_1_accuracy(recs),
             "m2_mean_delta": metric_2_mean_delta_by_correctness(recs),
             "m3_visual_gain": metric_3_visual_gain(recs),
+            "m5a_student_teacher_overlap": metric_5a_student_teacher_overlap(
+                recs, student_vlmbias_by_id_topic.get(topic, [])
+            ),
         }
         for topic, recs in sorted(vlmbias_topics.items())
     }
