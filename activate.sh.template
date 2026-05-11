@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# activate.sh.template — opd-exp project activation
+#
+# Usage:
+#   cp activate.sh.template activate.sh
+#   # Edit activate.sh — at minimum, point OPDEXP_FAST_ROOT at your machine's fast disk
+#   source activate.sh
+#
+# This template is committed. The actual `activate.sh` is gitignored because
+# it carries machine-specific paths.
+#
+# What this script does:
+#   1) Activates the project venv.
+#   2) Unsets NGC PyTorch image's pip constraints — they lock torch/triton to
+#      NGC versions and break our install.
+#   3) Exports compile-time env vars (CUDA arch, max jobs, TE backend) needed
+#      when TransformerEngine / flash-attn ever get rebuilt.
+#
+# Do NOT add `pip install` or `uv pip install` lines here. Environment setup
+# on this machine is documented in CLAUDE.md and run by hand — automation has
+# repeatedly broken the carefully built TE / flash-attn binaries.
+
+# ============================================================================
+# Machine-specific paths — override by exporting before `source activate.sh`
+# ============================================================================
+# Fast-disk root for caches and venvs (default ~/.cache fills the root partition).
+export OPDEXP_FAST_ROOT="${OPDEXP_FAST_ROOT:-/root/shihao_project}"
+export OPDEXP_VENV="${OPDEXP_VENV:-${OPDEXP_FAST_ROOT}/env/opd-exp}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${OPDEXP_FAST_ROOT}/.uv}"
+
+# ============================================================================
+# Activate venv
+# ============================================================================
+if [ ! -f "${OPDEXP_VENV}/bin/activate" ]; then
+    echo "[activate.sh] ERROR: venv not found at ${OPDEXP_VENV}" >&2
+    echo "  Set OPDEXP_FAST_ROOT / OPDEXP_VENV for this machine, or create the venv first:" >&2
+    echo "    uv venv --python 3.12 ${OPDEXP_VENV}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+# shellcheck disable=SC1091
+source "${OPDEXP_VENV}/bin/activate"
+
+# ============================================================================
+# Bypass NGC PyTorch image's pip constraints  (CRITICAL — do not remove)
+# ============================================================================
+# /etc/pip/constraint.txt on NGC images pins torch/triton/etc. to NGC versions.
+# Leaving this active means standard vLLM/transformers install will fail or
+# silently grab the wrong torch.
+unset PIP_CONSTRAINT
+# Also have pip ignore the system-level pip.conf for the same reason.
+export PIP_CONFIG_FILE=/dev/null
+
+# ============================================================================
+# Compile-time env vars (for TransformerEngine / flash-attn rebuilds)
+# ============================================================================
+# H100 / H800 = SM 9.0. +PTX keeps forward compatibility.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0+PTX}"
+# Parallel build jobs — H800 box has plenty of CPU. Lower on smaller machines.
+export MAX_JOBS="${MAX_JOBS:-32}"
+# TransformerEngine framework backend.
+export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-pytorch}"
+# Where nvcc finds headers.
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+
+echo "[activate.sh] opd-exp env active"
+echo "  venv:       ${OPDEXP_VENV}"
+echo "  python:     $(which python)"
+echo "  uv cache:   ${UV_CACHE_DIR}"
+echo "  cuda arch:  ${TORCH_CUDA_ARCH_LIST}"

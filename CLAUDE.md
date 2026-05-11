@@ -26,6 +26,91 @@ Treat `verl/` as third-party code that we both **use as a library** and may **mo
 
 When the user asks to "run" a script, assume they will run it on the remote machine themselves — do **not** invent local Bash commands that touch model weights. Generate the script and let them execute.
 
+## Environment setup (NGC machine specifics)
+
+The remote machine is based on an **NVIDIA NGC PyTorch image**. It has two hidden traps that have repeatedly broken `pip install`:
+
+1. **`PIP_CONSTRAINT=/etc/pip/constraint.txt`** is set by the image and pins `torch` / `triton` / etc. to NGC versions. Standard vLLM-compatible `torch` install fails or silently grabs the wrong version until this is `unset`.
+2. **`/usr/local/lib/python3.12/dist-packages/torch/`** is a customized NGC torch (`2.8.0a0+nv25.6`). It leaks into PEP 517 build-isolation envs and links compiled extensions (TransformerEngine, flash-attn) against the wrong ABI → `undefined symbol` at import time. The fix is to install those extensions with `--no-build-isolation` inside the project venv.
+
+Both traps are dealt with in `activate.sh`. **Before doing anything on a fresh machine**:
+
+```bash
+cp activate.sh.template activate.sh
+# edit activate.sh → set OPDEXP_FAST_ROOT (and OPDEXP_VENV if your venv lives elsewhere)
+source activate.sh
+```
+
+After that, the venv is active and `PIP_CONSTRAINT` / `PIP_CONFIG_FILE` are neutralized for this shell.
+
+### Installing / re-installing packages — the `--no-deps` rule
+
+> **All `pip install -e` and `uv pip install -e` on this machine must pass `--no-deps`.** No exceptions unless the user explicitly says "update dependencies".
+
+```bash
+# install verl as editable (correct)
+uv pip install --no-deps -e ./verl
+```
+
+Why: `verl` declares vLLM / torch / TransformerEngine / flash-attn as dependencies. Without `--no-deps`, uv re-resolves and reinstalls those, which silently overwrites the hand-built TransformerEngine binary. **Rebuilding TE takes 30–40 minutes** and you don't want to repeat it because of a careless install.
+
+If you ever need to rebuild TransformerEngine from scratch:
+
+```bash
+pip install --no-deps --no-build-isolation -v \
+    git+https://github.com/NVIDIA/TransformerEngine.git@v2.6
+```
+
+Both `--no-deps` and `--no-build-isolation` are required: the former protects existing deps, the latter prevents the build env from pulling in the NGC system torch.
+
+### Known pitfalls (already mitigated, listed for memory)
+
+- **`huggingface-hub` auto-upgrades to 1.x** during transitive installs, but `transformers 4.56.1` requires `<1.0`. Pin: `pip install "huggingface-hub>=0.34.0,<1.0"`.
+- **verl's install script downloads a `flash_attn-*.whl` into the cwd** as a side effect. Safe to `rm` it after install.
+- **`pip check` warns `decord 0.6.0 not supported on this platform`** — ignore. verl uses decord on a video path we don't exercise.
+- **Don't touch the `.venv` symlink layout on the server.** It's machine-specific and not part of this repo's contract.
+
+### Verified versions (snapshot — bump only when intentional)
+
+`torch 2.8.0+cu128`, `vllm 0.11.0`, `TransformerEngine 2.6.0+c90a7207`, `megatron-core 0.13.1`, `flash-attn 2.8.1`, `flashinfer 0.3.1`, `numpy 1.26.4` (held below 2.0). Full freeze on the server at `/root/shihao_project/env-snapshots/opd-exp-freeze-20260511.txt`.
+
+### Do not automate this
+
+Environment setup is **documented, not scripted**. Past attempts to wrap it in a single `setup.sh` kept regressing when one dependency version drifted and triggered TE rebuilds. If something needs to change, edit this section of CLAUDE.md, not `activate.sh`.
+
+## Modifying verl or recipe (three-layer commit workflow)
+
+`verl/` is a submodule, and `verl/recipe/` is a nested submodule inside it. Editing code in either of these triggers a chain of commits:
+
+| Where you edit | Repo that owns it | Push target | Then in parent |
+|---|---|---|---|
+| `verl/recipe/gkd/*.py` (or any `verl/recipe/...`) | `verl-project/verl-recipe` (fork to `shihaohou/verl-recipe` first if you'll push) | the recipe fork | `verl/` records new recipe submodule SHA |
+| `verl/...` (not under recipe) | `shihaohou/verl` | `shihaohou/verl` | `opd-exp/` records new verl submodule SHA |
+| `experiments/...`, `CLAUDE.md`, etc. | `shihaohou/opd-exp` | `shihaohou/opd-exp` | — |
+
+Concretely for a recipe edit:
+
+```bash
+# (one-time) ensure verl/recipe points to your fork
+cd verl/recipe
+git remote set-url origin git@github.com:shihaohou/verl-recipe.git   # or HTTPS
+git checkout -b my-feature
+# ... edit ...
+git commit -m "..." && git push origin my-feature
+
+cd ..                                   # back to verl/
+git add recipe                          # records the new recipe SHA
+git commit -m "Bump recipe to <sha>" && git push origin <branch>
+
+cd ..                                   # back to opd-exp/
+git add verl                            # records the new verl SHA
+git commit -m "Bump verl: <reason>" && git push
+```
+
+For a plain `verl/` edit (not under `recipe/`), drop the inner-most step.
+
+If a request requires changes to verl source, confirm with the user before editing inside `verl/` — those changes flow to the fork and ripple up two submodule pointers.
+
 ## Datasets (E0)
 
 On the remote machine. Three datasets, in priority order:
@@ -91,7 +176,6 @@ The diagnostic pipeline (`experiments/E0_image_null_delta/src/`) is meant to be 
 - **Greedy decoding** for both teacher generation and forced scoring throughout E0. No sampling.
 - **Top-50 KL** for `delta_t` (truncate the support to top-50 of `p_T(.|x,I,y_<t)` ∪ top-50 of `p_T(.|x,null,y_<t)`, renormalize, then KL). Avoids long-tail noise.
 - **Null image** = a single all-black PIL image of the same resolution as the real image (resize to match per sample). Cache the encoder output if it speeds things up.
-
-## When in doubt
-
-If a request requires changes to verl source, confirm with the user before editing inside `verl/` — those changes flow to the `shihaohou/verl` fork and affect the submodule pointer in the parent repo.
+- **Editable installs always with `--no-deps`** on the server (see *Environment setup* for the rationale — TE binary protection).
+- **No automated environment setup.** If a tool / install / patch needs to be applied to the server, document the command in this file and let the human run it. Do not generate `setup.sh` or wire it into CI.
+- **Don't touch the `.venv` symlink layout** on the server — it's machine-specific.
