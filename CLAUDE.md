@@ -113,57 +113,137 @@ If a request requires changes to verl source, confirm with the user before editi
 
 ## Datasets (E0)
 
-On the remote machine. Three datasets, in priority order:
+All three are pre-downloaded under `/home/web_server/antispam/project/houshihao/datasets/` on the remote machine, in HF `Dataset.save_to_disk()` arrow format. Schemas confirmed against the HF dataset cards.
 
-1. **VLMBias** — main hypothesis: does language prior override visual evidence? Use 500–1000 samples (or full).
-2. **POPE-adversarial** — object hallucination under adversarial negatives. 1000 samples.
-3. **MathVista-mini** — visual reasoning sanity. 500 samples.
+### 1. VLMBias — primary battleground
 
-(MMMU and ScienceQA are *not* in the E0 scope. Stay focused.)
+- Local path: `datasets/VLMBias/` (a `DatasetDict` with sub-configs: `main`, `identification`, `withtitle`, `original`, `remove_background_q1q2`, `remove_background_q3`)
+- HF: [`anvo25/vlms-are-biased`](https://huggingface.co/datasets/anvo25/vlms-are-biased)
+- **For E0 we use `main` (2,780 rows) as the primary subset.** The `withtitle` / `remove_background_*` subsets are for Step 2 sensitivity ablation.
+- Key columns:
+  - `image` — PIL image
+  - `prompt` — question text (already includes "Answer in curly brackets, e.g., {Yes} or {No}.")
+  - `ground_truth` — gold answer (e.g. "Yes")
+  - **`expected_bias`** — the biased wrong answer (e.g. "No"). **Use this for metric 3** (`gain(correct) > gain(biased_wrong)`).
+  - `topic` / `sub_topic` — category labels for subgroup acc breakdowns
+  - `type_of_question` — Q1 / Q2 / Q3 variant
+- Budget for E0: use all 2,780 rows of `main`.
+
+### 2. POPE-adversarial — hallucination floor
+
+- Local path: `datasets/POPE-adversarial/` (single arrow file — already the adversarial split, no need to filter on `category`)
+- HF: [`lmms-lab/POPE`](https://huggingface.co/datasets/lmms-lab/POPE) with `category == "adversarial"` (3,000 rows in the upstream split; verify local row count)
+- Key columns:
+  - `image` — PIL image
+  - `question` — yes/no question (e.g. "Is there a snowboard in the image?")
+  - `answer` — gold "yes" or "no"
+  - `category` — should be all "adversarial" since we have the pre-filtered split
+- **Hallucination/grounded classification:** when model answers `yes`:
+  - gold=`yes` → **grounded** (correct positive)
+  - gold=`no` → **hallucinated** (false positive)
+- Budget for E0: 1,000 samples (random first 1,000, fixed seed).
+
+### 3. MathVista-mini — visual reasoning sanity
+
+- Local path: `datasets/MathVista-mini/` (single arrow file — already the `testmini` split)
+- HF: [`AI4Math/MathVista`](https://huggingface.co/datasets/AI4Math/MathVista) `testmini` (1,000 rows)
+- Key columns:
+  - **`decoded_image`** — PIL image (NOT `image` — that column is a filename string, easy footgun)
+  - `question` — text
+  - `choices` — list of strings for `multi_choice`, empty/None for `free_form`
+  - `answer` — gold answer (full choice text for multi_choice, not a letter)
+  - `question_type` — `multi_choice` or `free_form`
+  - `metadata` — dict with `task`, `category`, `skills`, `grade`, `source`
+- Budget for E0: 500 samples (random first 500 of testmini, fixed seed).
+
+(MMMU and ScienceQA are *not* in the E0 scope. They show up in E1 evaluation.)
 
 ## E0: Image-vs-Null Teacher Delta Diagnostic
 
-**Forward-only. No training.** Step 0 of the Delta-OPD plan: verify that image-vs-null KL can distinguish visual contribution before committing to Step 1 training.
+**Forward-only. No training.** Step 0 of the Delta-OPD plan: verify that image-vs-null KL can distinguish visual-evidence-driven tokens from language-prior-driven tokens. If this doesn't hold, don't train — pivot to claim-gated OPD instead.
+
+### Backend
+
+- **HF transformers + bf16 + flash-attn-2** for E0. Slow but per-token logits / forced scoring are one-liners and easy to trust.
+- vLLM is reserved for E1 rollout. Do not use vLLM in E0 — its prompt-logprobs path is awkward for forced scoring and complicates debugging.
+
+### Models
+
+- **Primary teacher (E0 default)**: Qwen2.5-VL-32B-Instruct — full pass on all three datasets.
+- **Sanity teacher**: Qwen2.5-VL-72B-Instruct — 200–300 sample sanity check only. Do **not** launch a 72B full run until the 32B pass shows signal.
+- **Student**: Qwen2.5-VL-7B-Instruct — generated answers used only for metric 5a (student/teacher wrong overlap). Student does **not** get forced scoring in E0.
+
+### Null image
+
+For E0 we use **only two** null modes (other masks — Gaussian, patch shuffle, irrelevant image — are Step 2):
+
+1. **`black`** — all-black PIL image, resized to match the real image per sample. This is the default and always works.
+2. **`image_drop`** — omit the image entirely from the prompt, if the Qwen2.5-VL processor accepts it cleanly. If image_drop changes the prompt format in a way that introduces an obvious confound (e.g. the `<image>` token still required), fall back to `black` only and note it.
+
+The YAML config controls `null_modes` — start with `[black]` for first run, add `image_drop` once verified on server.
 
 ### Core procedure
 
 For each sample `(x, I, gold_answer)`:
 
 ```
-p_T_I    = teacher.forward(x, I)
-p_T_null = teacher.forward(x, black_image)
-ans_T_I  = teacher.generate(x, I, greedy)
-ans_S_I  = student.generate(x, I, greedy)
+# generate teacher response with image (greedy)
+ans_T_I  = teacher.generate(x, I,    greedy)
+# generate student response with image (for metric 5a)
+ans_S_I  = student.generate(x, I,    greedy)
+# (also record teacher answer under null for metric 1)
+ans_T_null = teacher.generate(x, null, greedy)
 ```
 
-Then forced-score the teacher's own response token-by-token under both image and null conditions:
+Then forced-score teacher's own image-conditioned response `ans_T_I` token-by-token under both conditions:
 
 ```
 logp_I[t]    = log p_T(y_t | x, I,    y_<t)
 logp_null[t] = log p_T(y_t | x, null, y_<t)
-
-delta_t = KL_top50( p_T(. | x, I, y_<t),  p_T(. | x, null, y_<t) )
-cmi_t   = logp_I[t] - logp_null[t]
+delta_t      = KL_top50( p_T(. | x, I, y_<t),  p_T(. | x, null, y_<t) )
+cmi_t        = logp_I[t] - logp_null[t]
 ```
 
-Per-sample record (jsonl): question, image_id, gold, ans_T_I, ans_S_I, correctness flags, full `delta_t[]`, `logp_I[t]`, `logp_null[t]`, token list.
+Per-sample jsonl record: dataset, sample_id, question, gold, ans_T_I, ans_T_null, ans_S_I, correctness flags (each), full `delta_t[]`, `logp_I[t]`, `logp_null[t]`, token strings, and dataset-specific fields (VLMBias `expected_bias`/`topic`/`sub_topic`, POPE `answer`, MathVista `question_type`/`metadata.task`).
 
-### Metrics & go/no-go
+### Metrics & go/kill
 
-| # | Metric | Want to see | If not |
+| # | Metric | Dataset | Want to see |
 |---|---|---|---|
-| 1 | `Acc(T, image)` vs `Acc(T, null)` on VLMBias | `Acc(T, image) > Acc(T, null)` | Teacher isn't using image → Delta-OPD has no basis. **Abort.** |
-| 2 | `mean_delta(correct)` vs `mean_delta(wrong)` | correct samples have higher mean delta_t | Delta signal doesn't track visual reliance. **Reconsider.** |
-| 3 | Answer-level visual gain: `log P(correct\|I) - log P(correct\|null)` vs same for biased-wrong option | `gain(correct) > gain(biased_wrong)` | Image input is reinforcing wrong prior too → Delta-OPD risk. |
-| 4 | Token-level: top-delta tokens | They land on vision-bearing tokens (object names, numbers, yes/no), not formatting | Delta is noise. |
-| 5 | Student-teacher wrong-overlap on VLMBias | Overlap high (justifies need for visual masking) | Vanilla OPD already fine. |
+| 1 | `Acc(T, image)` vs `Acc(T, null)` | VLMBias | `Acc(T, image) > Acc(T, null)` by meaningful margin |
+| 2 | `mean_delta(correct)` vs `mean_delta(wrong)`, plus Spearman(mean_delta, correctness) | VLMBias | correct samples have higher mean delta; Spearman significantly positive |
+| 3 | Answer-level visual gain: `log P(ground_truth \| I) - log P(ground_truth \| null)` vs same for `expected_bias` | VLMBias (uses `expected_bias` column) | `gain(ground_truth) > gain(expected_bias)` |
+| 4 | Top-delta tokens — qualitative category labelling | All datasets, hand-inspect ~50 | Object / number / color / spatial / yes-no words dominate over connectives, templates, formatting |
+| 5a | Student-teacher wrong-overlap (same biased answer rate) | VLMBias | Non-trivial overlap — flags Delta-OPD's *need*, not OPD's failure |
+| 5b | `mean_delta(hallucinated)` vs `mean_delta(grounded)` | POPE-adv (when model answers "yes") | hallucinated < grounded — image evidence weaker on hallucinations |
 
-**Go criterion for Step 1**: on VLMBias, per-trajectory mean `delta_t` is significantly positively correlated with answer correctness, AND `Acc(T, image) > Acc(T, null)` by a meaningful margin.
+**MathVista-mini** is a sanity check for visual reasoning retention, not a hypothesis-test dataset for E0; we record acc & per-trajectory mean_delta for tracking, not for go/kill.
+
+**Go criterion (proceed to E1 training)**: at least **2 of 5** primary criteria satisfied:
+- (1) `Acc(T, image) > Acc(T, null)` by meaningful margin on VLMBias
+- (2) trajectory-mean `delta_t` significantly correlates with correctness on VLMBias
+- (3) `gain(ground_truth) > gain(expected_bias)` on VLMBias
+- (4) high-delta tokens are vision-bearing on qualitative inspection
+- (5b) hallucinated samples have lower mean_delta than grounded on POPE-adv
+
+**Kill criterion (pivot to claim-gated OPD)**: 0–1 of the above hold; *or* teacher accuracy is image-invariant on VLMBias (signal source absent at the root); *or* high-delta tokens look random.
 
 ### First-day budget
 
-- 32B teacher: full E0 pass on all three datasets.
-- 72B teacher: 200–300 sample sanity only. Do **not** launch a full 72B run on day 1.
+- 32B teacher: full E0 pass on all three datasets (VLMBias `main` 2780 + POPE-adv 1000 + MathVista testmini 500).
+- 72B teacher: 200–300 sample sanity only — first 200 of VLMBias `main`. Do **not** launch a full 72B run on day 1.
+- Student 7B: same coverage as 32B teacher (greedy, image-conditioned only, for metric 5a).
+
+### Deliverables (what comes out of E0)
+
+In `experiments/E0_image_null_delta/results/`:
+- `e0_teacher32b_vlmbias.jsonl` (and equivalents for pope/mathvista, student, 72B-sanity)
+- `e0_summary.csv` — one row per (model, dataset), columns = the 5 metrics
+- Figures from `analysis/e0_report.ipynb`:
+  - Fig 1: VLMBias `mean_delta` distribution split by correctness
+  - Fig 2: Top-delta-token histogram by hand-labeled category
+  - Fig 3: POPE `mean_delta` distribution split by hallucinated vs grounded
+- A short markdown verdict at `results/e0_verdict.md` (one paragraph: go / kill / which criteria passed).
 
 ## Long-term codebase plan
 
