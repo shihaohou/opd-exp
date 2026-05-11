@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Experiment outputs — keep directories tracked via .gitkeep, ignore contents
+experiments/*/results/**
+!experiments/*/results/.gitkeep
+experiments/*/data/cache/
+experiments/*/data/raw/
+*.jsonl.tmp
+
+# Large binary artifacts (just in case)
+*.ckpt
+*.pt
+*.safetensors
+*.bin
