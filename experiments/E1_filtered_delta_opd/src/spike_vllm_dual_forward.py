@@ -103,6 +103,10 @@ def main():
         max_model_len=args.max_model_len,
         limit_mm_per_prompt={"image": 1},
         trust_remote_code=True,
+        # vLLM caps prompt_logprobs at `max_logprobs` (default 20). We need
+        # at least K to satisfy our SamplingParams(prompt_logprobs=K). For
+        # E1 on-policy v1, K=50 matches E0's `delta_t` top-50 union.
+        max_logprobs=args.top_k,
     )
     print(f"[spike] model loaded in {(time.time()-t0)/60:.1f} min", flush=True)
 
