@@ -1,5 +1,12 @@
 # Agent instructions — opd-exp
 
+> **🟢 If you are starting a new session, READ THESE FIRST, in order:**
+> 1. **This file (`CLAUDE.md`)** — project conventions, environment, datasets, commit workflow.
+> 2. **[`PROGRESS.md`](PROGRESS.md)** — what's been built and what we found so far.
+> 3. **[`NEXT.md`](NEXT.md)** — what to do next, open questions, hard rules.
+> 4. **[`experiments/E0_image_null_delta/results/e0_verdict.md`](experiments/E0_image_null_delta/results/e0_verdict.md)** — the canonical scientific verdict for E0.
+> 5. **[`experiments/E1_filtered_delta_opd/README.md`](experiments/E1_filtered_delta_opd/README.md)** — the design doc for the next experiment phase.
+
 This is the **experiment workspace** for Delta-OPD (off-policy distillation for VLMs guided by per-token image-vs-null teacher delta). It is *not* the verl framework repo; verl is a git submodule at `verl/`.
 
 ## Repo layout
