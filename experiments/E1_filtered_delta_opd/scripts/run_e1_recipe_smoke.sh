@@ -64,6 +64,16 @@ MAX_NUM_TOKENS=$(( MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1 ))
 # that path available to the driver, controller actor, and worker processes.
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
+# ---- cuDNN v8 API workaround for Qwen2.5-VL vision-tower Conv3d ----
+# Without this, the BF16 Conv3d in Qwen2.5-VL's patch_embed triggers a cuDNN v9
+# split-library load (libcudnn_engines_runtime_compiled.so or sibling) that
+# fails with CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED in this NGC PyTorch image.
+# Setting this falls back to the v7 API for cuDNN ops; conv/SDPA paths are
+# unaffected speed-wise on Qwen2.5-VL since attention goes through flash-attn-2.
+# Long-term: fix the LD_LIBRARY_PATH leak from NGC system torch (see
+# docs/migrate-env.md once root-cause repro lands).
+export TORCH_CUDNN_V8_API_DISABLED="${TORCH_CUDNN_V8_API_DISABLED:-1}"
+
 # ---- Hydra overrides on top of the recipe yaml ----
 python -m experiments.E1_filtered_delta_opd.src.on_policy.entrypoint \
     --config-path="$PWD/experiments/E1_filtered_delta_opd/configs" \
