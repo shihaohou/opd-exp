@@ -309,7 +309,6 @@ def register_delta_opd_agent_loop() -> type:
     )
     from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 
-    @register("delta_opd_single_turn")
     class DeltaOPDAgentLoop(SingleTurnAgentLoop):
         """Single-turn rollout with per-sample KL/CE dispatch for Delta-OPD."""
 
@@ -408,7 +407,9 @@ def register_delta_opd_agent_loop() -> type:
             self._attach_e1_extra_fields(output, kwargs, loss_branch="kl")
             return output
 
+    DeltaOPDAgentLoop.__qualname__ = "DeltaOPDAgentLoop"
     globals()["DeltaOPDAgentLoop"] = DeltaOPDAgentLoop
+    register("delta_opd_single_turn")(DeltaOPDAgentLoop)
     _AGENT_LOOP_REGISTERED = True
     return DeltaOPDAgentLoop
 
