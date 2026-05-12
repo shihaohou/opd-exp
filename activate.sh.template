@@ -67,3 +67,25 @@ echo "  venv:       ${OPDEXP_VENV}"
 echo "  python:     $(which python)"
 echo "  uv cache:   ${UV_CACHE_DIR}"
 echo "  cuda arch:  ${TORCH_CUDA_ARCH_LIST}"
+
+# ============================================================================
+# Detect-only environment sanity checks
+# ============================================================================
+# These warn about known-issue conditions but never auto-fix anything. Auto-
+# fixing from this script would violate the no-automation rule at the top
+# (past automation silently broke hand-built TE / flash-attn binaries).
+# See docs/migrate-env.md for diagnoses and manual fix commands.
+
+# Check Q5: triton ldconfig UnicodeDecodeError on HPC-X machines.
+# Pure-python probe — no model imports, no triton init. Fast.
+if command -v python >/dev/null 2>&1; then
+    if ! python -c "import subprocess; subprocess.check_output(['/sbin/ldconfig','-p']).decode()" 2>/dev/null; then
+        echo "[activate.sh] ⚠️  WARNING: 'ldconfig -p' output contains non-UTF-8 bytes." >&2
+        echo "    This will crash triton when any CUDA kernel JIT-compiles (typically" >&2
+        echo "    inside vLLM's profile_run on multimodal models)." >&2
+        echo "    Fix (one-time per venv): see docs/migrate-env.md § Q5." >&2
+        echo "    Quick form:" >&2
+        echo "      sed -i 's/decode()/decode(\"utf-8\", errors=\"ignore\")/' \\" >&2
+        echo "        \"${VIRTUAL_ENV}/lib/python3.12/site-packages/triton/backends/nvidia/driver.py\"" >&2
+    fi
+fi

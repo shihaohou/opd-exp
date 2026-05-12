@@ -36,6 +36,10 @@ When the user asks to "run" a script, assume they will run it on the remote mach
 
 ## Environment setup (NGC machine specifics)
 
+> **For step-by-step troubleshooting** (symptom → diagnosis → fix command) of
+> the issues listed below, see [`docs/migrate-env.md`](docs/migrate-env.md).
+> This section is the *short* form for context; that doc is the runbook.
+
 The remote machine is based on an **NVIDIA NGC PyTorch image**. It has two hidden traps that have repeatedly broken `pip install`:
 
 1. **`PIP_CONSTRAINT=/etc/pip/constraint.txt`** is set by the image and pins `torch` / `triton` / etc. to NGC versions. Standard vLLM-compatible `torch` install fails or silently grabs the wrong version until this is `unset`.
@@ -73,10 +77,11 @@ Both `--no-deps` and `--no-build-isolation` are required: the former protects ex
 
 ### Known pitfalls (already mitigated, listed for memory)
 
-- **`huggingface-hub` auto-upgrades to 1.x** during transitive installs, but `transformers 4.56.1` requires `<1.0`. Pin: `pip install "huggingface-hub>=0.34.0,<1.0"`.
+- **`huggingface-hub` auto-upgrades to 1.x** during transitive installs, but `transformers 4.56.1` requires `<1.0`. Pin: `pip install "huggingface-hub>=0.34.0,<1.0"`. ([Q4](docs/migrate-env.md#q4-huggingface-hub-auto-upgrades-to-1x-and-breaks-transformers))
 - **verl's install script downloads a `flash_attn-*.whl` into the cwd** as a side effect. Safe to `rm` it after install.
 - **`pip check` warns `decord 0.6.0 not supported on this platform`** — ignore. verl uses decord on a video path we don't exercise.
 - **Don't touch the `.venv` symlink layout on the server.** It's machine-specific and not part of this repo's contract.
+- **Triton `ldconfig` UnicodeDecodeError on HPC-X machines** (e.g. dev box 1; dev box 3 is unaffected). vLLM crashes during `profile_run` before any request. `activate.sh.template` warns at startup; manual sed fix per [Q5](docs/migrate-env.md#q5-triton-ldconfig-unicodedecodeerror-on-machines-with-hpc-x). `LC_ALL=C` does NOT help.
 
 ### Verified versions (snapshot — bump only when intentional)
 
