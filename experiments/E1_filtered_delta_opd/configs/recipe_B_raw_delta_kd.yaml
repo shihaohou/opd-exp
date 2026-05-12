@@ -5,6 +5,11 @@
 # Role: tests whether image-influence weighting alone helps; E0 predicts NO
 # on VLMBias recognition topics (delta is wrong-direction there).
 
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - file://verl/verl/trainer/config
+
 defaults:
   - e1_base
   - _self_

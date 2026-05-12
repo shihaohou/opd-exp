@@ -3,10 +3,18 @@
 # No delta_t weighting, no teacher-correct filtering.
 # Role: existing-OPD baseline we want to beat. See README.md § Configs.
 #
-# Even with this baseline, the dual-forward teacher still runs (cost ~2×
-# vs single-teacher), because the worker patch is global. Loss just ignores
-# the delta_t it produced. Set distillation.teacher_dual_forward=false in a
-# follow-up if you want to skip the null pass for the A baseline only.
+# The worker patch detects need_delta=False from the loss_mode name and skips
+# the null teacher forward (image forward only) — see agent_loop.py for the
+# branching logic. Saves ~50% teacher GPU time vs B/D.
+
+# Hydra requires `searchpath` on the *primary* config (= the file Hydra loads
+# first via --config-name). Declaring it on the intermediate e1_base is too
+# late because the `defaults: [ppo_trainer]` resolution starts before e1_base's
+# own hydra.searchpath would be read.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - file://verl/verl/trainer/config
 
 defaults:
   - e1_base

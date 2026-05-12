@@ -11,14 +11,11 @@
 #     and data.train_files / data.val_files are MANDATORY (Hydra '???' sentinel);
 #     pass them as CLI overrides or via the wrapper script.
 
-hydra:
-  searchpath:
-    # Load verl's ppo_trainer.yaml as a Python package resource so we don't
-    # depend on launch CWD. Inside the submodule the layout is verl/verl/
-    # trainer/config/, but the Python package import path is verl.trainer.config,
-    # so the pkg:// scheme resolves regardless of where the launcher runs from.
-    - pkg://verl.trainer.config
-
+# NOTE: hydra.searchpath that lets `defaults: [ppo_trainer]` resolve must be
+# declared in the *primary* config (the recipe_*.yaml file passed as
+# --config-name), not here. Hydra reads searchpath only from the primary
+# config before walking the defaults tree, so putting it in this base yaml
+# would be too late. See recipe_A_vanilla_kd.yaml for the canonical form.
 defaults:
   - ppo_trainer
   - _self_

@@ -1,15 +1,18 @@
 # E1 Config C — FilteredKD (critical control)
-# Loss (per-sample dispatch):
+# Loss (per-sample dispatch via agent_loop + losses.py):
 #   if T_correct: Σ_t KL_topK(P_T^I || P_S)
-#   else:         0           ← mask-only in this first cut (CE-on-gold deferred)
-# Role: isolates the contribution of teacher-correctness filtering from
-# delta_t weighting. WITHOUT C in the sweep, any D > A gain is unattributable
+#   else:         β · NLL(student | "Final answer: \boxed{X}.")   ← CE-on-gold
+# Role: isolates the contribution of teacher-correctness filtering + CE-on-gold
+# from delta_t weighting. WITHOUT C in the sweep, any D > A gain is unattributable
 # to delta. Do NOT drop C from the sweep — see NEXT.md § Hard rules.
 #
-# NOTE: First-cut Stage 2 uses mask-only filtering (zero KL on teacher-wrong
-# samples). The locked v1 design replaces zero with β · CE(student | gold).
-# Switching requires per-sample rollout branching at the agent loop level;
-# tracked as the v1.5 milestone (NEXT.md open question #7).
+# Worker patch skips null teacher forward (need_delta=False), saving ~50%
+# teacher GPU time.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - file://verl/verl/trainer/config
 
 defaults:
   - e1_base
