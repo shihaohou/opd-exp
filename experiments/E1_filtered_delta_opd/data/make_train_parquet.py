@@ -5,15 +5,19 @@ What this script does:
 
 1. Reads one or more shard jsonls from ``precompute_teacher.py``. Those
    carry the sample-level signals we need (``trajectory_pass`` from the
-   verifier, ``gold``, ``question``, ``bucket``) plus a bunch of fields
-   we discard (per-token teacher logp / delta_t — those are stale because
-   v1 recomputes them online on the *student's* rollout, not the
-   teacher's).
+   verifier, ``gold``, ``question``, ``bucket``, and — for jsonls written
+   after Day 2 — ``image_paths``) plus a bunch of fields we discard
+   (per-token teacher logp / delta_t — those are stale because v1
+   recomputes them online on the *student's* rollout, not the teacher's).
 
-2. Looks up each sample's image bytes from the source dataset (v1: only
-   ViRL39K — bucket 2/3 loaders land in Day 2). Stored as a
-   ``{"bytes": ...}`` dict so verl's ``RLHFDataset._build_messages``
-   can decode it via PIL.
+2. Resolves each sample's image bytes via one of two strategies:
+   - Prefer ``rec["image_paths"]`` if present (Day 2+ schema — set by
+     precompute_teacher.py for every bucket).
+   - Fall back to a per-bucket lookup table. For ViRL39K this re-walks
+     ``39Krelease.parquet`` (existing path; preserves backward compat for
+     the existing Day 1.5 smoke jsonls that pre-date the schema change).
+   Stored as a ``{"bytes": ...}`` dict so verl's
+   ``RLHFDataset._build_messages`` can decode it via PIL.
 
 3. Formats the gold answer per the GPT-locked v1 template:
 
@@ -194,14 +198,24 @@ def build_row(
 # Main pipeline.
 # ---------------------------------------------------------------------------
 
+ACCEPTED_BUCKETS = {"virl39k", "pope_style", "tallyqa", "synthetic"}
+
+
 def build_parquet(
     jsonl_paths: list[Path],
-    virl39k_root: Path,
     student_tokenizer_path: str,
     output_parquet: Path,
+    virl39k_root: Path | None = None,
     limit: int | None = None,
     chat_template_version: str = "qwen2_5_vl_default",
 ) -> None:
+    """Convert precompute jsonls into a verl-ingestable training parquet.
+
+    `virl39k_root` is required only when the input jsonl includes virl39k
+    samples that lack an inline `image_paths` field (i.e., produced before
+    Task #6 of Day 2). Newer precompute jsonls carry `image_paths` for
+    every sample, in which case `virl39k_root` may be omitted.
+    """
     # Heavy imports localized so the module imports on Mac for inspection.
     from transformers import AutoTokenizer
     import pyarrow as pa
@@ -212,25 +226,64 @@ def build_parquet(
         "[tokenizer] loaded %s vocab_size=%d", student_tokenizer_path, tokenizer.vocab_size
     )
 
-    virl_lookup = build_virl39k_image_lookup(virl39k_root)
+    # Build virl39k_lookup lazily — only touched if a virl39k rec lacks
+    # inline image_paths. Avoids reading the ViRL39K parquet for synth /
+    # POPE-style / TallyQA runs.
+    virl_lookup: dict[str, list[Path]] | None = None
+
+    def _get_virl39k_lookup() -> dict[str, list[Path]]:
+        nonlocal virl_lookup
+        if virl_lookup is None:
+            if virl39k_root is None:
+                raise RuntimeError(
+                    "ViRL39K record lacks inline `image_paths` and no "
+                    "`virl39k_root` was provided. Either re-run precompute "
+                    "(which writes image_paths into the record) or pass "
+                    "`--virl39k-root`."
+                )
+            virl_lookup = build_virl39k_image_lookup(virl39k_root)
+        return virl_lookup
 
     rows: list[dict] = []
-    counts = {"yielded": 0, "missing_image": 0, "unsupported_bucket": 0, "empty_gold": 0}
+    counts = {
+        "yielded": 0,
+        "missing_image": 0,
+        "unsupported_bucket": 0,
+        "empty_gold": 0,
+        "load_error": 0,
+    }
 
     for idx, rec in enumerate(iter_precompute_records(jsonl_paths)):
         if limit is not None and counts["yielded"] >= limit:
             break
 
         bucket = rec.get("bucket", "")
-        if bucket == "virl39k":
-            image_paths = virl_lookup.get(rec["sample_id"])
-            if not image_paths:
+        if bucket not in ACCEPTED_BUCKETS:
+            counts["unsupported_bucket"] += 1
+            continue
+
+        # Image-bytes resolution — prefer inline image_paths, fall back to
+        # the ViRL39K lookup for old smoke-run jsonls.
+        image_paths_strs = rec.get("image_paths")
+        if image_paths_strs:
+            image_paths = [Path(p) for p in image_paths_strs]
+        elif bucket == "virl39k":
+            looked_up = _get_virl39k_lookup().get(rec["sample_id"])
+            if not looked_up:
                 counts["missing_image"] += 1
                 continue
-            image_bytes = [load_image_bytes(p) for p in image_paths]
+            image_paths = looked_up
         else:
-            # Bucket 2/3 builders land in Day 2 (POPE-style, synth, TallyQA).
-            counts["unsupported_bucket"] += 1
+            # Non-virl39k bucket lacks inline paths → precompute predates
+            # Task #6; user must re-run precompute.
+            counts["missing_image"] += 1
+            continue
+
+        try:
+            image_bytes = [load_image_bytes(p) for p in image_paths]
+        except FileNotFoundError as e:
+            logger.warning("[build] image not on disk for %s: %s", rec.get("sample_id"), e)
+            counts["load_error"] += 1
             continue
 
         gold = (rec.get("gold") or "").strip()
@@ -278,8 +331,11 @@ def parse_args() -> argparse.Namespace:
         help="One or more precompute_teacher.py jsonl shards. Glob patterns supported by shell.",
     )
     p.add_argument(
-        "--virl39k-root", required=True,
-        help="Path to ViRL39K root (contains 39Krelease.parquet and images/)",
+        "--virl39k-root", default=None,
+        help="Path to ViRL39K root (contains 39Krelease.parquet and images/). "
+             "Only required when the input jsonl has virl39k records that "
+             "lack an inline `image_paths` field (i.e., produced before "
+             "Day 2 / Task #6). Newer precompute jsonls don't need this.",
     )
     p.add_argument(
         "--student-tokenizer", required=True,
@@ -304,7 +360,7 @@ def main() -> None:
     args = parse_args()
     build_parquet(
         jsonl_paths=[Path(p) for p in args.jsonl],
-        virl39k_root=Path(args.virl39k_root),
+        virl39k_root=Path(args.virl39k_root) if args.virl39k_root else None,
         student_tokenizer_path=args.student_tokenizer,
         output_parquet=Path(args.output),
         limit=args.limit,

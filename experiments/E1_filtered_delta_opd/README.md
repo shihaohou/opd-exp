@@ -1,6 +1,60 @@
-# E1 — Filtered Delta-OPD (design doc, not yet executable)
+# E1 — Filtered Delta-OPD
 
-**Status**: design doc / starting point for tomorrow.
+> **E1 Protocol — read this first.**
+> *Locked after external review on 2026-05-13. This box is the source of truth for what E1 is for; if any concrete plan elsewhere in this doc contradicts the box, the box wins.*
+>
+> **Goal.** E1 is the first **training-side causal experiment** for Delta-OPD. E0 showed `delta_t` tracks image influence, but image influence can be wrong-direction on VLMBias adversarial-recognition topics. E1 tests three things:
+> 1. Does vanilla on-policy KD inherit teacher wrong patterns?
+> 2. Does raw delta weighting *amplify* wrong-direction image influence?
+> 3. Does correctness-filtered Delta-OPD *reduce* teacher-error inheritance without hurting POPE / MathVista?
+>
+> **E1 is not a score-chasing experiment.** It is a causal test of the inheritance mechanism. SOTA on any single benchmark is out of scope for E1-mini.
+>
+> **Models (fixed for E1-mini)**: Student = Qwen2.5-VL-7B-Instruct, Teacher = Qwen2.5-VL-32B-Instruct. Do **not** add 72B in E1-mini — variable explosion.
+>
+> **Data (8K E1-mini; ratios fixed for v1)**:
+> - 4K ViRL39K (PassRate∈[0.3, 0.9], single-image, stratified by category)
+> - 1.6K POPE-style on COCO train2017 (yes:no=1:1, POPE-adv eval-id disjoint)
+> - 2.4K adversarial recognition (1.5K synthetic counterfactuals + 0.9K TallyQA complex)
+>
+> **Configs (4 on-policy ablations)**:
+> - **A** `VanillaKD` — all samples, w_t = 1
+> - **B** `RawDeltaKD` — all samples, w_t = normalized delta_t (negative control)
+> - **C** `FilteredKD` — KL on T_correct; β·CE-on-gold otherwise (filtering control)
+> - **D** `FilteredDeltaKD` — KL × delta_t on T_correct; β·CE-on-gold otherwise (primary candidate)
+>
+> **Primary comparisons (the only ones that matter for the causal story)**:
+> - **B vs A** — does raw delta amplify wrong-direction image influence?
+> - **C vs A** — does filtering + CE reduce teacher-error inheritance?
+> - **D vs C** — does delta weighting add value *beyond* filtering + CE?
+> - **D vs B** — does filtering block wrong-direction delta?
+>
+> Compute fallback: drop B first. **Do NOT drop C** — without C, D's gain is not attributable to delta.
+>
+> **Primary metrics (ordered, all output by `src/eval_tei.py`)**:
+> 1. VLMBias Recognition Aggregate accuracy (Animals + Chess Pieces + Flags + Logos + Game Boards + Patterned Grid)
+> 2. TEI rate = `P(S_after = T_wrong_answer | T_wrong)` — **lower is better**
+> 3. Escape rate = `P(S_after = GT | T_wrong AND S_base = T_wrong_answer)` — **higher is better**
+> 4. Student-side length-normalized `gain_margin` on VLMBias recognition topics
+>
+> **Safety metrics**:
+> - POPE-adv: accuracy, F1, yes-rate, hallucinated-yes rate (Delta-OPD must not amplify object hallucination)
+> - MathVista-mini: accuracy, response length (retention; must not drop > 1pp)
+>
+> **Outcome interpretation tree** (so we know what each result *means* before we look at it):
+> - **Ideal** — `B < A` on recognition; `C > A` on TEI; `D > C` on recognition or gain_margin; POPE / MathVista unchanged. → Full Delta-OPD story holds.
+> - **Acceptable** — `B ≈ A`; `C > A`; `D ≈ C`; POPE / MathVista unchanged. → Method gain comes from filtering + CE; rename to "Correctness-filtered on-policy distillation".
+> - **Danger (`D > A` but `D ≈ C`)** — CE-on-gold is doing the work, not delta. Re-examine `kl_ce_ratio` per bucket; if CE dominates, increase β sweep or reduce CE weight in v2.
+> - **Uninformative** — A/B/C/D all similar, or all hurt POPE/MathVista. → Method does not move the needle at 8K; either scale up or pivot to claim-gated OPD.
+>
+> **Day-3 ordering (eval-first)** — see `NEXT.md` § "Right now, Day 3": (1) implement `src/eval_tei.py`, (2) Bucket-3 teacher sanity, (3) 1K mini-sweep + eval, (4) 8K full sweep. Do NOT precompute the 8K before `eval_tei.py` exists — otherwise the run produces only ordinary accuracy and the causal questions stay unanswered.
+>
+> **Hard rule**: `e1_offline_weighted_sft_*` (off-policy weighted SFT in `src/losses.py`) is a pipeline smoke baseline only. **Never report it as an E1 scientific result.**
+
+---
+
+**Status**: code complete through Day 1.5 (on-policy trainer + 4 configs verified on 50 ViRL39K) and Day 2 (data pipeline, locally unit-tested). Day 3 (eval_tei + Bucket-3 sanity + 1K mini-sweep) is the next milestone.
+
 **Goal**: Train a 7B Qwen2.5-VL student from a 32B Qwen2.5-VL teacher using
 Filtered Delta-OPD, with a 4-config ablation that establishes whether the
 delta signal — when conditioned on teacher correctness — actually reduces

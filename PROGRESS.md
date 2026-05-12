@@ -1,5 +1,5 @@
 # PROGRESS — what has been built and what we found
-*Last updated: 2026-05-13 (after Day 1.5 / Stage 2 v1 smoke). Last commit: `b58932b7`.*
+*Last updated: 2026-05-13 (after Day 2 data pipeline). Last commit: `5d4b5826` (B/C/D smoke verified). Day 2 code shipped locally, awaiting commit.*
 
 > **For new Claude sessions:** read this file first, then `NEXT.md`, then `CLAUDE.md`. Read the latest `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical E0 findings; read `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` for the canonical E1 training design. New: read `docs/e1_smoke_runbook.md` if anything in the on-policy trainer breaks at smoke time.
 
@@ -8,12 +8,13 @@
 ## TL;DR
 
 - **Project**: Delta-OPD — **on-policy** distillation for VLMs reweighted by per-token image-vs-null teacher KL.
-- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1.5 / Stage 2 v1 complete** — on-policy trainer code lands and **all 4 configs (A/B/C/D) pass smoke**: 12 train steps + validation + checkpoint on 50 ViRL39K samples each. Health-check metrics in band: B/D `delta_t_mean_post_norm ≈ 1.0`; C/D `kl_ce_ratio = 0.5` (well within the GPT-flagged [0.3, 0.7] attribution-guard band). Next is Day 2 (buckets 2 + 3 data builders + dedup + 8K mixture).
+- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1.5 / Stage 2 v1 complete** — on-policy trainer code + all 4 configs (A/B/C/D) verified end-to-end on 50 ViRL39K samples; B/D `delta_t_mean_post_norm ≈ 1.0`, C/D `kl_ce_ratio = 0.5` in the [0.3, 0.7] attribution-guard band. E1 **Day 2 data pipeline complete locally** (POPE-style builder / TallyQA loader / synthetic counterfactuals / 3-layer dedup / 8K mixture sampler / multi-bucket parquet builder — all unit-tested, awaiting commit and server-side data download for Day 3 precompute).
 - **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; failures (delta-correctness correlation, gain_margin on VLMBias) are *informative* and constrain E1 method choice.
-- **E0.3-B finding (today)**: Length-normalized `gain_margin` confirms VLMBias per-topic direction is **stable** (no sign flips). Motivation is not a length-bias artifact.
-- **E1 design (locked today)**: On-policy v1. 4 configs A/B/C/D = `VanillaKD` / `RawDeltaKD` / `FilteredKD` / `FilteredDeltaKD`. **C is the critical control** — without it any D > A gain is unattributable to delta. Loss = top-K sparse forward KL on student-rollout prefixes, optionally × normalized `delta_t` × `1[T_correct]` mask, with CE-on-gold branch for teacher-wrong samples.
-- **E1 mixture (locked, GPT-reviewed)**: 8K E1-mini = 4K ViRL39K (PassRate∈[0.3,0.9], single-image) + 1600 self-built POPE-style on COCO train (NOT official POPE — image leakage) + 2400 (1500 synth VLMBias-like + 900 TallyQA complex). Mandatory dedup pipeline pre-launch. Bucket 1 only is built so far; buckets 2/3 are Day 2.
-- **Stage 2 v1 status (Day 1.5)**: all 4 losses, agent-loop manager + worker subclass, parquet builder, launcher → committed. Config A smoke run passed (12 / 12 steps, val OK, checkpoint OK). 5 non-obvious integration traps hit + resolved — written up in `docs/e1_smoke_runbook.md` (NCCL duplicate-GPU from early CUDA init, Hydra `<locals>` qualname, cuDNN v9 sublib load on Conv3d, multimodal prompt-cap + filter mutation bug, missing reward registry).
+- **E0.3-B finding**: Length-normalized `gain_margin` confirms VLMBias per-topic direction is **stable** (no sign flips). Motivation is not a length-bias artifact.
+- **E1 design (locked)**: On-policy v1. 4 configs A/B/C/D = `VanillaKD` / `RawDeltaKD` / `FilteredKD` / `FilteredDeltaKD`. **C is the critical control** — without it any D > A gain is unattributable to delta. Loss = top-K sparse forward KL on student-rollout prefixes, optionally × normalized `delta_t` × `1[T_correct]` mask, with CE-on-gold branch for teacher-wrong samples.
+- **E1 mixture (locked, GPT-reviewed)**: 8K E1-mini = 4K ViRL39K (PassRate∈[0.3,0.9], single-image, stratified by category) + 1600 self-built POPE-style on COCO train2017 (NOT official POPE — image leakage; POPE-adv eval-id disjoint filter mandatory) + 2400 (1500 synth VLMBias-like + 900 TallyQA complex with COCO-id leakage filter). Three-layer dedup mandatory pre-launch.
+- **Stage 2 v1 status (Day 1.5)**: all 4 losses, agent-loop manager + worker subclass, parquet builder, launcher → committed. All 4 configs A/B/C/D pass smoke on 50 ViRL39K. 5 non-obvious integration traps hit + resolved in `docs/e1_smoke_runbook.md` (NCCL duplicate-GPU from early CUDA init, Hydra `<locals>` qualname, cuDNN v9 sublib load on Conv3d, multimodal prompt-cap + filter mutation bug, missing reward registry).
+- **Day 2 status (today)**: 6 deliverables shipped + locally unit-tested (35 unit tests across the data layer). `BUCKET_ITERS` in `precompute_teacher.py` now exposes 5 buckets (virl39k / pope_style / tallyqa / synthetic / mixture); `make_train_parquet.py` accepts all 4 individual buckets with `image_paths` resolution from precompute records (virl39k lookup retained as backward-compat fallback). No verl source touched; no submodule bumps needed. **Blocker for Day 3: server-side download of COCO train2017 + TallyQA (~20 GB).**
 - **Headline**: `delta_t` tracks image influence, but the *direction* can be wrong on VLMBias adversarial recognition. **The right E1 recipe is `FilteredDeltaKD` (D)**, with `RawDeltaKD` (B) as negative-control and `FilteredKD` (C) as filtering-only control.
 
 ---
@@ -249,17 +250,103 @@ mechanical level (e.g., late-register vs Ray hook for loss registration —
 the design doc didn't specify a registration mechanism). The math and the
 4-config matrix are exactly as designed.
 
-### What is NOT in Day 1.5 (deferred to Day 2+)
+### What is NOT in Day 1.5 (closed by Day 2 below, except long-term cleanups)
 
-- `data/pope_style_builder.py` — Day 2
-- `data/tallyqa_loader.py` — Day 2
-- `data/synthesize_counterfactuals.py` — Day 2
-- `data/dedup_check.py` — Day 2 (mandatory before any non-smoke launch)
-- `data/mixture.py` — Day 3 (samples 8K E1-mini from the 3 buckets)
+- `data/pope_style_builder.py` — **Day 2 ✅**
+- `data/tallyqa_loader.py` — **Day 2 ✅**
+- `data/synthesize_counterfactuals.py` — **Day 2 ✅**
+- `data/dedup_check.py` — **Day 2 ✅** (must pass before non-smoke launch)
+- `data/mixture.py` — **Day 2 ✅**
 - `src/eval_tei.py` — Day 3-4 (TEI / Escape / per-topic gain_margin + MathVista retention)
-- B / C / D smoke runs on GPU (1 hour each at the smoke scale; cheap, just hasn't been driven yet)
+- B / C / D smoke runs on the new 8K mixture — Day 3 (Day 1.5's B/C/D runs were on 50 ViRL39K, not on multi-bucket)
 - Long-term fix for the cuDNN v9 sublib load (LD_LIBRARY_PATH cleanup; runbook R3 "Long-term")
 - Long-term fix for `filter_overlong_prompts` (verl `_build_messages` mutation; runbook R4 "Long-term")
+
+---
+
+## E1 — Day 2 / Data pipeline (2026-05-13)
+
+Day 2 ships the rest of the data layer needed for the 8K E1-mini run.
+**All 6 deliverables landed locally with unit tests; nothing committed
+yet and nothing exercised on the server (COCO train2017 + TallyQA still
+need to be downloaded — see § "Day 3 prerequisites" in NEXT.md).** No
+verl source was touched; no submodule bumps needed.
+
+### Code built (locally, awaiting commit)
+
+| File | Purpose | Local unit tests |
+|---|---|---|
+| `experiments/E1_filtered_delta_opd/data/pope_style_builder.py` | Bucket 2: POPE-style yes/no on COCO train2017. random/popular/cooccur negatives, yes:no=1:1, mandatory POPE-adv eval-id disjoint filter. `COCOInstanceIndex` reusable across builders. | 4/4 (index, quota, disjoint, question format) |
+| `experiments/E1_filtered_delta_opd/data/tallyqa_loader.py` | Bucket 3a: TallyQA `complex` subset with COCO-id × POPE-adv leakage filter; answer rewrapped as `\boxed{N}`. Accepts both JSON-list and JSONL ingests. | 7/7 (filters, JSONL/wrapped-list/answer-range/seed determinism) |
+| `experiments/E1_filtered_delta_opd/data/synthesize_counterfactuals.py` | Bucket 3b: parametric synth of 5 topics (patterned_grid / flag / game_board / chess_position / animal). PIL-only generators + `build_synthetic_counterfactuals` writes images and `manifest.jsonl`. | 7/7 (per-topic, determinism, build/iter round-trip, gold range) |
+| `experiments/E1_filtered_delta_opd/data/dedup_check.py` | 3-layer dedup against POPE-adv + VLMBias `main` evals: (1) numeric image_id ∩, (2) pHash Hamming<5, (3) CLIP cos>0.95. Exit-1 on any finding (intended for CI gate). | Layer-1 + edges (imagehash/open_clip not on Mac); Layers 2-3 run on server |
+| `experiments/E1_filtered_delta_opd/data/mixture.py` | 8K E1-mini sampler. Stratified ViRL39K by category with slack-redistribution; POPE-style 1600; TallyQA 900; synth 1500. Writes uniform `mixture.jsonl`. Graceful skip on missing-bucket inputs. | 6/6 (proportional, capped strata, empty strata, e2e synth-only, missing-bucket skip) |
+| `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` (updated) | Multi-bucket: `ACCEPTED_BUCKETS = {virl39k, pope_style, tallyqa, synthetic}`. Reads image bytes from `rec["image_paths"]` (Day-2 schema); virl39k lookup retained as fallback for Day-1.5 smoke jsonls. | e2e simulate-without-GPU ✓ |
+| `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` (updated) | `BUCKET_ITERS` now has all 5 (`virl39k` / `pope_style` / `tallyqa` / `synthetic` / `mixture`). Output record carries `image_paths` + lets `extras["bucket"]` override the function-arg bucket (so mixture rows tag themselves with the original sub-bucket). | CLI choices verified; lazy imports preserved |
+| `experiments/E1_filtered_delta_opd/data/__init__.py` (updated) | Exports 15 new APIs. | import sanity ✓ |
+
+### Day-2 design notes (not derivable from code alone)
+
+- **POPE-adv disjointness is not automatic from the COCO 2014 vs 2017 split**. train2017 = train2014 ∪ (val2014 \\ minival5k), so val2014 image_ids (POPE's sampling pool) sit inside train2017. We extract POPE-adv's actual image-id set at runtime via `load_pope_adv_image_ids` and filter explicitly. Same id-set is reused by the TallyQA loader (any COCO-sourced TallyQA row in the set is dropped).
+- **Stratified sampling with slack redistribution**: ViRL39K categories have very uneven sizes (Geometric ~9k vs other categories smaller); pure proportional sampling under-allocates the small categories. Algorithm: proportional targets → cap at availability → redistribute slack among uncapped strata, repeat until n_target hit or no slack moves. Verified by unit test.
+- **Animal silhouettes use PIL geometric shapes** (body ellipse + leg rectangles + head circle). They give the student counting practice on variable leg-count creatures, but **won't strongly trigger the photo-realist "dog → canonical 4 legs" recognition prior** the way VLMBias photos do. Documented in the file's docstring. If D vs C doesn't move on the Animals topic in eval, this is a known suspect — v2 should consider CLIP-guided / diffusion-based animal generation.
+- **Chess pieces are letter glyphs on colored discs** (K/Q/R/B/N/P), not Unicode chess characters. Avoids TTF portability issues while still presenting an 8×8 board with discrete white-vs-black piece counts.
+- **Schema bridge**: `precompute_teacher.py` now writes `image_paths` into every output record, so `make_train_parquet.py` doesn't need a per-bucket lookup table for non-virl39k buckets. The legacy virl_lookup path is kept as a fallback for the Day-1.5 smoke jsonls that pre-date this schema.
+- **`mixture` is a meta-bucket** in `BUCKET_ITERS`. It reads a pre-built `mixture.jsonl` (from `data/mixture.py`); each row's true bucket lives in `extras["bucket"]`. `process_sample` honors that override so per-bucket monitoring in `on_policy/losses.py` sees the four bucket names (virl39k / pope_style / tallyqa / synthetic), not the meta-name.
+- **Synth build is a separate step** (writes ~1500 PNGs + manifest under `out_dir`), not inline in the mixture call. Lets the user inspect images before sampling. The mixture call expects the synth manifest to already exist; `--build-synth` flag at CLI builds on the fly when absent.
+
+### Verification status
+
+- **Local unit tests**: 35 tests across the 6 new files, all passing.
+- **End-to-end multi-bucket simulate-without-GPU**: synth → mixture manifest → simulated precompute jsonl → parquet pipeline reads cleanly. ✓
+- **CLI surfaces**: `precompute_teacher.py --help`, `mixture.py --help`, `dedup_check.py --help` all show updated bucket choices / args.
+- **Layer 2/3 of dedup**: skipped locally (no `imagehash` / `open_clip_torch` on Mac); requires server-side run.
+- **Backward compatibility**: the Day-1.5 Config A smoke path (virl39k bucket, no inline `image_paths` in record) still works via the retained virl39k lookup fallback in `make_train_parquet.py`.
+
+### What is NOT in Day 2 (deferred to Day 3+)
+
+- **Server-side data download** (~20 GB): COCO `train2017/` + `annotations/instances_train2017.json`; TallyQA `train.json` + image directory (COCO train2014/val2014 + VG_100K). Pre-req for everything in Day 3 § Right now.
+- **`src/eval_tei.py`** — Day 3-4.
+- **Actual precompute on the 8K mixture** — Day 3 (estimate: ~5-7h sequential / ~1h with 8-shard parallel on 8×H800).
+- **B/C/D smoke on the 8K mixture** — Day 3. The Day-1.5 B/C/D results used 50 ViRL39K samples only; per-bucket `kl_ce_ratio` on the multi-bucket mixture is expected to differ.
+- **Full 4-config sweep** — Day 4.
+- **R3/R4 long-term cleanups** — pending, not blocking Day 3.
+
+---
+
+## External review (2026-05-13 evening) — E1 goal realignment
+
+After Day 2 close, external GPT review flagged that the planned Day 3 ordering ("8K precompute → 4-config train → eval") was structurally backwards: a few days of training compute *before* producing the metrics E1 was actually designed to test (TEI / Escape / per-topic gain_margin). The realignment is now encoded in:
+
+- A new **E1 Protocol** block at the top of `experiments/E1_filtered_delta_opd/README.md` — 4 hypotheses, 4 configs, primary vs safety metrics, outcome interpretation tree.
+- A rewritten "Right now, Day 3" section in `NEXT.md` — eval-first 4-step plan replacing the old "precompute → train" ordering.
+
+Core realignment in one line:
+
+> E1 is the first training-side **causal experiment** for Delta-OPD. The question is not "does the student score higher" — it is "does vanilla OPD inherit teacher wrong patterns, does raw delta amplify wrong-direction image influence, and does correctness-filtered Delta-OPD reduce inheritance".
+
+Day-3 reordered to 4 steps (strict order):
+
+1. **`src/eval_tei.py` (CPU, ~250 LoC)** — VLMBias per-topic + Recognition Aggregate + TEI / Escape + POPE yes-rate + MathVista retention. Unit-testable with fixture jsonls on Mac before any GPU work.
+2. **Bucket-3 teacher sanity** — run `precompute_teacher.py --bucket synthetic` on all 1500 synth images; check per-topic teacher accuracy + gain_margin + canonical-prior trigger rate. **Gate**: if teacher accuracy on `animal` is ≥80% and gain_margin doesn't go negative, the silhouettes are too toy — fix data before training.
+3. **1K mini-sweep** — drop 8K mixture to 1K (same per-bucket ratio), A/B/C/D × ~50 steps, immediately call eval_tei. Look at *direction*, not magnitude. Cheap (~1.5h vs ~12h for 8K).
+4. **8K full sweep** — only after 1-3 pass.
+
+Also locked into the protocol:
+
+- **Primary metrics ordering**: VLMBias Recognition Aggregate / TEI rate / Escape rate / gain_margin. **Safety**: POPE yes-rate / MathVista retention. **Secondary**: loss curves / `kl_ce_ratio` / `delta_t` distribution.
+- **Outcome interpretation tree** — ideal / acceptable / danger (`D > A` but `D ≈ C`; CE-on-gold steals credit) / uninformative — each with a fallback action so we don't fish for narratives after the fact.
+- **Hard rule**: never report `e1_offline_weighted_sft_*` (off-policy weighted SFT in `src/losses.py`) as an E1 scientific result. Smoke baseline only.
+
+What was already aligned (no change needed):
+
+- Off-policy precompute path already labeled "NOT E1 results" in `README.md` § "Off-policy smoke baseline".
+- 72B teacher already deferred to sanity check, not an E1-mini variable.
+- Day-1.5 B/C/D smoke (50 ViRL39K) explicitly required to be re-verified on the multi-bucket mixture in Day 3 Step 3 (with eval_tei).
+
+External-review-flagged data risk (carried into Step 2 above):
+
+- **Animal silhouettes may be too toy.** Current PIL geometric shapes (body ellipse + leg rectangles + head circle) won't fire a strong "dog → canonical 4 legs" recognition prior. If Step 2 confirms teacher isn't being mis-led by the silhouettes, the synth pipeline needs a v2 with CLIP-guided / diffusion-based animal generation. Other 4 synth topics (grid / flag / board / chess) are not flagged.
 
 ---
 
@@ -363,9 +450,14 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | E1 design / 4-config matrix / mixture / engineering punch list | `experiments/E1_filtered_delta_opd/README.md` |
 | **E1 on-policy v1 trainer design (canonical)** | `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` |
 | E1 bucket-1 loader (ViRL39K) | `experiments/E1_filtered_delta_opd/data/virl39k_loader.py` |
-| E1 offline precompute (`trajectory_pass` + gold + sample metadata) | `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` |
+| **E1 bucket-2 builder (POPE-style on COCO train2017)** | `experiments/E1_filtered_delta_opd/data/pope_style_builder.py` |
+| **E1 bucket-3a loader (TallyQA complex)** | `experiments/E1_filtered_delta_opd/data/tallyqa_loader.py` |
+| **E1 bucket-3b builder (synthetic counterfactuals)** | `experiments/E1_filtered_delta_opd/data/synthesize_counterfactuals.py` |
+| **E1 three-layer dedup check (image_id / pHash / CLIP)** | `experiments/E1_filtered_delta_opd/data/dedup_check.py` |
+| **E1 8K mixture sampler** | `experiments/E1_filtered_delta_opd/data/mixture.py` |
+| E1 offline precompute (`trajectory_pass` + gold + sample metadata, all 5 buckets) | `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` |
 | **E1 on-policy v1 trainer code (Stage 2)** | `experiments/E1_filtered_delta_opd/src/on_policy/` |
-| **E1 parquet builder (jsonl → train.parquet)** | `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` |
+| **E1 multi-bucket parquet builder (jsonl → train.parquet)** | `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` |
 | **E1 recipe configs (A/B/C/D)** | `experiments/E1_filtered_delta_opd/configs/recipe_*.yaml` |
 | **E1 smoke launcher** | `experiments/E1_filtered_delta_opd/scripts/run_e1_recipe_smoke.sh` |
 | E1 off-policy smoke-baseline losses (NOT scientific results) | `experiments/E1_filtered_delta_opd/src/losses.py` |

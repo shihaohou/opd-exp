@@ -108,11 +108,102 @@ def _virl39k_iter(
         yield (s.sample_id, s.question, s.image_paths, s.gold, dict(s.extras))
 
 
+def _pope_style_iter(
+    coco_train_root: str,
+    annotations_path: str,
+    pope_adv_root: Optional[str] = None,
+    n_samples: int = 1600,
+    seed: int = 42,
+    **kwargs,
+) -> Iterator[tuple[str, str, list[Path], str, dict]]:
+    """POPE-style bucket: yields self-built yes/no samples on COCO train2017.
+
+    `pope_adv_root` (when provided) is used to extract POPE-adv eval image
+    ids so the loader can filter them out of the eligible pool.
+    """
+    from experiments.E1_filtered_delta_opd.data.pope_style_builder import (
+        iter_pope_style, load_pope_adv_image_ids,
+    )
+
+    pope_ids = load_pope_adv_image_ids(pope_adv_root) if pope_adv_root else set()
+    for s in iter_pope_style(
+        coco_train_root=coco_train_root,
+        annotations_path=annotations_path,
+        pope_adv_eval_ids=pope_ids,
+        n_samples=n_samples,
+        seed=seed,
+        **kwargs,
+    ):
+        yield (s.sample_id, s.question, s.image_paths, s.gold, dict(s.extras))
+
+
+def _tallyqa_iter(
+    json_path: str,
+    images_root: str,
+    pope_adv_root: Optional[str] = None,
+    n_max: int = 900,
+    seed: int = 42,
+    **kwargs,
+) -> Iterator[tuple[str, str, list[Path], str, dict]]:
+    """TallyQA complex bucket with COCO-id leakage filter."""
+    from experiments.E1_filtered_delta_opd.data.tallyqa_loader import iter_tallyqa
+    from experiments.E1_filtered_delta_opd.data.pope_style_builder import load_pope_adv_image_ids
+
+    pope_ids = load_pope_adv_image_ids(pope_adv_root) if pope_adv_root else set()
+    for s in iter_tallyqa(
+        json_path=json_path,
+        images_root=images_root,
+        coco_eval_image_ids=pope_ids,
+        n_max=n_max,
+        seed=seed,
+        **kwargs,
+    ):
+        yield (s.sample_id, s.question, s.image_paths, s.gold, dict(s.extras))
+
+
+def _synthetic_iter(
+    out_dir: str,
+) -> Iterator[tuple[str, str, list[Path], str, dict]]:
+    """Synthetic VLMBias-like counterfactuals; reads from manifest.jsonl."""
+    from experiments.E1_filtered_delta_opd.data.synthesize_counterfactuals import (
+        iter_synthetic_counterfactuals,
+    )
+
+    for s in iter_synthetic_counterfactuals(out_dir):
+        yield (s.sample_id, s.question, s.image_paths, s.gold, dict(s.extras))
+
+
+def _mixture_iter(
+    manifest_path: str,
+) -> Iterator[tuple[str, str, list[Path], str, dict]]:
+    """Mixture meta-bucket: reads a pre-built 8K manifest from `mixture.py`.
+
+    The original per-sample bucket (virl39k / pope_style / tallyqa /
+    synthetic) lands in `extras["bucket"]`; `process_sample` then
+    overrides the function-arg bucket with that per-sample value so the
+    output record's `bucket` field reflects the true source.
+    """
+    from experiments.E1_filtered_delta_opd.data.mixture import iter_mixture_manifest
+
+    for entry in iter_mixture_manifest(manifest_path):
+        extras = dict(entry.get("extras", {}))
+        # Canonicalize bucket inside extras so process_sample can override.
+        extras["bucket"] = entry["bucket"]
+        yield (
+            entry["sample_id"],
+            entry["question"],
+            [Path(entry["image_path"])],
+            entry["gold"],
+            extras,
+        )
+
+
 BUCKET_ITERS = {
     "virl39k": _virl39k_iter,
-    # "pope_style":  _pope_style_iter,        # TODO
-    # "tallyqa":     _tallyqa_iter,           # TODO
-    # "synthetic":   _synthetic_counterfactuals_iter,  # TODO
+    "pope_style": _pope_style_iter,
+    "tallyqa": _tallyqa_iter,
+    "synthetic": _synthetic_iter,
+    "mixture": _mixture_iter,
 }
 
 
@@ -235,9 +326,18 @@ def process_sample(
 
     correct_I = verifier_pass(ans_T_I, gold)
 
+    # For the `mixture` bucket the function-arg `bucket` is the meta-name;
+    # the true per-sample bucket lives in extras. Honor the per-sample value
+    # so downstream monitoring (per-bucket metrics in losses.py, parquet
+    # dispatch in make_train_parquet.py) sees the original bucket name.
+    out_bucket = extras.get("bucket", bucket)
+
     record: dict[str, Any] = {
-        "bucket": bucket,
+        "bucket": out_bucket,
         "sample_id": sample_id,
+        # Propagate image_paths so make_train_parquet.py can read bytes
+        # directly without per-bucket lookup tables.
+        "image_paths": [str(p) for p in image_paths],
         "category": extras.get("category"),
         "source": extras.get("source"),
         "pass_rate_32b": extras.get("pass_rate_32b"),
@@ -253,6 +353,8 @@ def process_sample(
         "teacher_logp_null": score_null["logp"][:T],
         "delta_t": delta_t,
         "T": T,
+        # Bucket-specific metadata (kept verbose for downstream eval / monitoring).
+        "extras": extras,
     }
     if tf_cfg.keep_topk_in_record:
         record["teacher_topk_log_probs_I"] = score_I["topk_log_probs"][:T]
@@ -266,13 +368,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="E1 offline teacher precompute")
     p.add_argument(
         "--bucket", required=True, choices=sorted(BUCKET_ITERS.keys()),
-        help="Which loader to use (v1 only supports 'virl39k')",
+        help="Which loader to use. For the full 8K E1-mini run, use "
+             "'mixture' with a pre-built manifest from data/mixture.py.",
     )
     p.add_argument(
         "--loader-kwargs", default="{}",
-        help="JSON dict of kwargs forwarded to the bucket loader. "
-             "Example for virl39k: "
-             '\'{"dataset_root": "/path/to/ViRL39K", "pass_rate_min": 0.3, "pass_rate_max": 0.9}\'',
+        help="JSON dict of kwargs forwarded to the bucket loader. Examples:\n"
+             '  virl39k:    \'{"dataset_root":"/path/to/ViRL39K","pass_rate_min":0.3,"pass_rate_max":0.9}\'\n'
+             '  pope_style: \'{"coco_train_root":"/path/to/coco","annotations_path":".../instances_train2017.json","pope_adv_root":".../POPE-adversarial","n_samples":1600}\'\n'
+             '  tallyqa:    \'{"json_path":".../train.json","images_root":".../tallyqa_images","pope_adv_root":".../POPE-adversarial","n_max":900}\'\n'
+             '  synthetic:  \'{"out_dir":".../synth_v1"}\' (requires manifest.jsonl already built)\n'
+             '  mixture:    \'{"manifest_path":".../mixture.jsonl"}\'',
     )
     p.add_argument("--model-path", required=True, help="HF teacher model path / id")
     p.add_argument("--output", required=True, help="Output jsonl path (shard-specific)")
