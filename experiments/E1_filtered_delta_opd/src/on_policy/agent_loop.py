@@ -335,49 +335,41 @@ def register_delta_opd_agent_loop() -> type:
             t_pass = _to_python_scalar(kwargs.get("trajectory_pass"), default=True)
             return "kl" if bool(t_pass) else "ce"
 
-        async def _run_ce_branch(self, kwargs: dict) -> AgentLoopOutput:
-            """Build an ``AgentLoopOutput`` for a CE sample (no vLLM rollout)."""
-            messages = list(kwargs["raw_prompt"])
-            multi_modal_data = await self.process_vision_info(messages)
-            images = multi_modal_data.get("images")
-            videos = multi_modal_data.get("videos")
-            prompt_ids = await self.apply_chat_template(
-                messages, images=images, videos=videos
-            )
+        def _override_with_gold_response(
+            self, output: AgentLoopOutput, kwargs: dict
+        ) -> None:
+            """Overwrite the rollout response on a CE sample with gold tokens.
 
+            We *do* call ``super().run()`` for CE samples so the AgentLoopOutput
+            structure (metrics, num_turns, routed_experts, response_logprobs slot,
+            and any extra_fields that vLLM TokenOutput adds — e.g. internal
+            counters that end up as non_tensor_batch entries at outer concat
+            time) stays identical to KL samples. Verl's
+            ``DataProto.concat(outputs)`` at the manager level asserts that all
+            per-sample non_tensor_batch keys have matching lengths across the
+            chunks; missing keys on CE-only chunks crash with
+            ``AssertionError: key <X> length 2 is not equal to batch size 4``.
+
+            After ``super().run()`` returns, we replace just the three fields
+            that define what the student should learn from this sample —
+            response_ids, response_mask, response_logprobs — with the gold-
+            token tail. The unused vLLM rollout is wasted (~1s per CE sample)
+            but the run goes through. Production should fix verl-side
+            concat to handle heterogeneous outputs and drop this rollout.
+            """
             gold_token_ids = _to_python_list_int(kwargs.get("gold_token_ids"))
             if not gold_token_ids:
-                # Safety: gold missing — should have been filtered at parquet build time.
-                # Fall back to a 1-token EOS so verl's padding doesn't choke; loss will
-                # contribute almost nothing.
                 eos = self.tokenizer.eos_token_id or 0
                 gold_token_ids = [eos]
                 logger.warning(
                     "[delta_opd] CE sample has no gold_token_ids; using [eos] fallback."
                 )
-
-            # Truncate to fit configured response width.
             if len(gold_token_ids) > self.response_length:
                 gold_token_ids = gold_token_ids[: self.response_length]
 
-            response_mask = [1] * len(gold_token_ids)
-
-            output = AgentLoopOutput(
-                prompt_ids=prompt_ids,
-                response_ids=gold_token_ids,
-                response_mask=response_mask,
-                response_logprobs=None,
-                multi_modal_data=multi_modal_data,
-                num_turns=1,
-                metrics=AgentLoopMetrics(),
-                extra_fields={
-                    # Shape-consistent with SingleTurnAgentLoop's run() output.
-                    "turn_scores": [],
-                    "tool_rewards": [],
-                },
-            )
-            self._attach_e1_extra_fields(output, kwargs, loss_branch="ce")
-            return output
+            output.response_ids = gold_token_ids
+            output.response_mask = [1] * len(gold_token_ids)
+            output.response_logprobs = None
 
         def _attach_e1_extra_fields(
             self, output: AgentLoopOutput, kwargs: dict, loss_branch: str
@@ -399,12 +391,17 @@ def register_delta_opd_agent_loop() -> type:
             )
 
         async def run(self, sampling_params, **kwargs):  # type: ignore[override]
+            # Always do the standard rollout so the AgentLoopOutput shape
+            # (and the set of non_tensor_batch keys verl's outer
+            # DataProto.concat checks for length parity) is identical
+            # across KL and CE samples in the same batch. For CE samples
+            # we then overwrite response_ids with gold tokens. See
+            # _override_with_gold_response().
+            output = await super().run(sampling_params, **kwargs)
             loss_branch = self._decide_loss_branch(kwargs)
             if loss_branch == "ce":
-                return await self._run_ce_branch(kwargs)
-
-            output = await super().run(sampling_params, **kwargs)
-            self._attach_e1_extra_fields(output, kwargs, loss_branch="kl")
+                self._override_with_gold_response(output, kwargs)
+            self._attach_e1_extra_fields(output, kwargs, loss_branch=loss_branch)
             return output
 
     DeltaOPDAgentLoop.__qualname__ = "DeltaOPDAgentLoop"
