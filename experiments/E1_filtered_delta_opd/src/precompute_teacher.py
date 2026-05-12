@@ -45,14 +45,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-# --- E0 helper imports (sys.path-injected; see TODO at top of file) ---------
-_EXPERIMENTS_ROOT = Path(__file__).resolve().parents[2]
-_E0_SRC = _EXPERIMENTS_ROOT / "E0_image_null_delta" / "src"
-if str(_E0_SRC) not in sys.path:
-    sys.path.insert(0, str(_E0_SRC))
-
-# Only imported lazily inside `run()` so the file is importable without torch.
-# (Static linters may complain; the lazy import keeps the module portable.)
+# --- Repo-root injection ----------------------------------------------------
+# E0's dual_forward uses absolute imports rooted at `experiments.E0_image_null_delta....`,
+# which only resolve when the repo root is on sys.path. When this script is
+# launched as `python experiments/E1_filtered_delta_opd/src/precompute_teacher.py`,
+# Python adds only the script's directory (src/), not the repo root, to sys.path.
+# Inject the repo root here so cross-experiment imports work.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # --- E1 bucket loader registry ---------------------------------------------
@@ -67,8 +68,7 @@ def _virl39k_iter(
     pass_rate_max: Optional[float] = 0.9,
 ) -> Iterator[tuple[str, str, list[Path], str, dict]]:
     # Lazy import — avoids dragging pyarrow when the user only inspects this file.
-    sys.path.insert(0, str(_EXPERIMENTS_ROOT / "E1_filtered_delta_opd"))
-    from data.virl39k_loader import iter_virl39k
+    from experiments.E1_filtered_delta_opd.data.virl39k_loader import iter_virl39k
 
     for s in iter_virl39k(
         dataset_root=dataset_root,
@@ -178,7 +178,7 @@ def process_sample(
 ) -> dict[str, Any]:
     """Run the dual-forward teacher pass on one E1 training sample."""
     from PIL import Image
-    from dual_forward import (  # noqa: E402  — sys.path-injected at module top
+    from experiments.E0_image_null_delta.src.dual_forward import (
         greedy_generate,
         forced_score,
         kl_topk_union,
