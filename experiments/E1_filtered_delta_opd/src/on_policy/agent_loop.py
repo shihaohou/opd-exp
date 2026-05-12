@@ -1,5 +1,5 @@
 """
-Delta-OPD agent loop + worker hook for E1 on-policy v1.
+Delta-OPD agent loop + worker subclass for E1 on-policy v1.
 
 Two pieces of plumbing into verl:
 
@@ -22,7 +22,7 @@ Two pieces of plumbing into verl:
    from the trainer config once at agent-loop init; "filtered" → C/D
    configs do filtering, A/B don't.
 
-2. ``AgentLoopWorker._compute_teacher_logprobs`` monkey-patch.
+2. ``DeltaOPDAgentLoopWorker._compute_teacher_logprobs`` override.
    Three cases, depending on the sample's branch and whether delta is
    needed by the recipe:
 
@@ -459,3 +459,58 @@ def enable_delta_opd() -> None:
     """Apply the worker patch and register the agent loop (idempotent)."""
     apply_delta_opd_worker_patch()
     register_delta_opd_agent_loop()
+
+
+def __getattr__(name: str):
+    """Materialize the lazily defined Hydra target on demand."""
+    if name == "DeltaOPDAgentLoop":
+        return register_delta_opd_agent_loop()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+from verl.experimental.agent_loop.agent_loop import (  # noqa: E402
+    AgentLoopManager as _VerlAgentLoopManager,
+    AgentLoopWorker as _VerlAgentLoopWorker,
+)
+
+
+class DeltaOPDAgentLoopWorker(_VerlAgentLoopWorker):
+    """AgentLoopWorker variant with E1 teacher-logprob dispatch."""
+
+    @property
+    def distillation_config(self):
+        cached = self.__dict__.get("_e1_distillation_config")
+        if cached is None:
+            from verl.utils.config import omega_conf_to_dataclass
+
+            cached = omega_conf_to_dataclass(self.config.distillation)
+            self.__dict__["_e1_distillation_config"] = cached
+        return cached
+
+    async def _compute_teacher_logprobs(
+        self,
+        output,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        validate: bool,
+        sample_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        await _dual_forward_compute_teacher_logprobs(
+            self,
+            output=output,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            validate=validate,
+            sample_kwargs=sample_kwargs,
+        )
+
+
+class DeltaOPDAgentLoopManager(_VerlAgentLoopManager):
+    """AgentLoopManager that launches the E1 worker subclass."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        import ray
+
+        self.agent_loop_workers_class = ray.remote(DeltaOPDAgentLoopWorker)

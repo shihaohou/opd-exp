@@ -54,11 +54,10 @@ MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
 MAX_NUM_TOKENS=$(( MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1 ))
 
-# ---- Pin PYTHONPATH so Ray workers can resolve the worker_process_setup_hook ----
-# The runtime_env.env_vars route is too late: Ray imports the hook FQDN before
-# applying the worker's env_vars. By exporting PYTHONPATH in the launcher shell,
-# the entire process tree (driver → Ray subprocesses → workers) inherits it,
-# and `experiments.E1_filtered_delta_opd...` resolves at hook-load time.
+# ---- Pin PYTHONPATH so Ray workers can resolve E1 custom modules ----
+# The agent-loop YAML and custom manager refer to experiments.E1_filtered_delta_opd
+# by fully qualified module name. Exporting PYTHONPATH in the launcher shell makes
+# that path available to the driver, controller actor, and worker processes.
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # ---- Hydra overrides on top of the recipe yaml ----

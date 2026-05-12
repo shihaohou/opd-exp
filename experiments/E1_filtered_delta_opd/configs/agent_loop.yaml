@@ -2,9 +2,7 @@
 #
 # verl's AgentLoopWorker loads this list at startup (via
 # rollout.agent.agent_loop_config_path) and instantiates by name through
-# Hydra. The Python class self-registers under the same name when
-# experiments/E1_filtered_delta_opd/src/on_policy/agent_loop.py is imported
-# (see register_delta_opd_agent_loop()), so this YAML is the verl-side
-# binding only.
+# Hydra. The Python class is materialized lazily by the module-level
+# __getattr__ in experiments/E1_filtered_delta_opd/src/on_policy/agent_loop.py.
 - name: delta_opd_single_turn
   _target_: experiments.E1_filtered_delta_opd.src.on_policy.agent_loop.DeltaOPDAgentLoop
