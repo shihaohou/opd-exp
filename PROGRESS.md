@@ -1,16 +1,19 @@
 # PROGRESS — what has been built and what we found
-*Last updated: 2026-05-12 (morning). Last commit: `c9615363`.*
+*Last updated: 2026-05-12 (evening, end of Day 1). Last commit: `f84fc00b`.*
 
-> **For new Claude sessions:** read this file first, then `NEXT.md`, then `CLAUDE.md`. Read the latest `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical scientific findings. This file is the prose narrative — verdict.md is the data.
+> **For new Claude sessions:** read this file first, then `NEXT.md`, then `CLAUDE.md`. Read the latest `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical E0 findings; read `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` for the canonical E1 training design.
 
 ---
 
 ## TL;DR
 
-- **Project**: Delta-OPD — on-policy distillation for VLMs reweighted by per-token image-vs-null teacher KL.
-- **Phase**: E0 (forward-only diagnostic) **complete**. E1 (training) **not yet started**, design doc exists at `experiments/E1_filtered_delta_opd/README.md`.
-- **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; the 2 that fail (delta-correctness correlation, gain_margin on VLMBias) fail in an *informative* way that constrains E1 method choice.
-- **Headline**: `delta_t` faithfully tracks image influence, but the *direction* of that influence is task-dependent — it's adversarial on VLMBias recognition topics. So the right E1 recipe is **Filtered Delta-OPD** (weight only on teacher-correct trajectories), with Raw Delta-OPD as negative-control ablation.
+- **Project**: Delta-OPD — **on-policy** distillation for VLMs reweighted by per-token image-vs-null teacher KL.
+- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1 complete** — design pivoted to on-policy after external review, ViRL39K loader built and verified, verl FSDP integration spike done, vLLM dual-forward verified end-to-end on Qwen2.5-VL-32B. E1 Stage 2 (on-policy trainer code) is next.
+- **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; failures (delta-correctness correlation, gain_margin on VLMBias) are *informative* and constrain E1 method choice.
+- **E0.3-B finding (today)**: Length-normalized `gain_margin` confirms VLMBias per-topic direction is **stable** (no sign flips). Motivation is not a length-bias artifact.
+- **E1 design (locked today)**: On-policy v1. 4 configs A/B/C/D = `VanillaKD` / `RawDeltaKD` / `FilteredKD` / `FilteredDeltaKD`. **C is the critical control** — without it any D > A gain is unattributable to delta. Loss = top-K sparse forward KL on student-rollout prefixes, optionally × normalized `delta_t` × `1[T_correct]` mask, with CE-on-gold branch for teacher-wrong samples.
+- **E1 mixture (locked today, GPT-reviewed)**: 8K E1-mini = 4K ViRL39K (PassRate∈[0.3,0.9], single-image) + 1600 self-built POPE-style on COCO train (NOT official POPE — image leakage) + 2400 (1500 synth VLMBias-like + 900 TallyQA complex). Mandatory dedup pipeline pre-launch.
+- **Headline**: `delta_t` tracks image influence, but the *direction* can be wrong on VLMBias adversarial recognition. **The right E1 recipe is `FilteredDeltaKD` (D)**, with `RawDeltaKD` (B) as negative-control and `FilteredKD` (C) as filtering-only control.
 
 ---
 
@@ -108,12 +111,64 @@ Recognition topics (everything except Optical Illusion) have negative `gain_marg
 
 ## External review
 
-Two independent passes by GPT (one after 32B-only, one after 7B added). Both converged on the same verdict as Claude. Genuine value-adds:
+Multiple GPT review passes converged on the same verdicts as Claude. Genuine value-adds:
 
+**During E0 (initial)**:
 - **Teacher-Error Inheritance (TEI) metric family** for E1: `Acc_S | T_wrong`, TEI rate, Escape rate. Codified in `experiments/E1_filtered_delta_opd/README.md`.
 - **Chance baseline** framing for 5a. Drove the per-topic table.
 - **Filtered Delta-OPD cannot fix Animals alone** (teacher acc = 0/546 → no positives to weight) — must combine with ground-truth CE.
-- **PPL-based overlap metrics** as complement to answer-overlap (deferred to E1 eval).
+
+**During E1 design (today)**:
+- **Don't use official POPE random/popular as bucket-2 training** — they share the COCO val 500 image pool with POPE-adversarial eval. Self-build POPE-style on COCO train instead.
+- **VLMBias `withtitle` / `remove_background_*` siblings are NOT image-disjoint with `main`** — they're title-injected variants of the same base counterfactuals. Synthesis-primary mix for bucket 3.
+- **Mandatory three-layer dedup** before training launch: image_id intersection + pHash near-duplicate + CLIP embedding NN.
+- **Per-bucket monitoring** with `kl_ce_ratio` attribution guard — if CE-on-gold dominates loss, D > C is unattributable to delta.
+- **OPD = On-Policy Distillation** (not off-policy). The first off-policy code drafts (precompute_teacher.py, losses.py) had to be reframed as smoke baselines; the real E1 trainer uses on-policy student rollouts. Design now in `on_policy_v1_design.md`.
+
+---
+
+## E1 — Day 1 progress (2026-05-12)
+
+### Locked design decisions
+
+- **On-policy, top-K sparse forward KL `KL_topK(P_T^I || P_S)` at student rollout prefixes.** Reverse KL deferred (mode-collapse risk per Thinking Machines, Entropy-Aware OPD 2026).
+- **4 configs renamed A/B/C/D**: `VanillaKD` / `RawDeltaKD` / `FilteredKD` (with CE-on-gold) / `FilteredDeltaKD` (with CE-on-gold). Central comparison is **D vs C** (does delta help given filtering?), with **B vs A** isolating raw delta and **C vs A** isolating filtering+CE.
+- **Verl backbone**: FSDP `verl/trainer/distillation/` + `verl/utils/dataset/rl_dataset.py` for multimodal + subclass `verl/experimental/agent_loop/SingleTurnAgentLoop` for dual-forward. NOT `recipe/gkd/` (Megatron-only). No verl source edits required.
+- **delta_t normalization**: `clip(delta_t, p95) / mean(clip)` per batch.
+- **8K E1-mini mixture**: 4K ViRL39K (PassRate∈[0.3,0.9], single-image) + 1600 self-built POPE-style on COCO train + 2400 (1500 synth VLMBias-like + 900 TallyQA complex).
+
+### Code built today (committed)
+
+| File | Purpose | Status |
+|---|---|---|
+| `experiments/E0_image_null_delta/src/metrics.py` | E0.3-B: length-normalized `gain_margin`. Loads Qwen tokenizer; boundary-trick `len(tok("\n"+opt)) - len(tok("\n"))`. Reports raw + lengthnorm. | ✅ Run on existing jsonls; no GPU re-run. **No sign flips.** |
+| `experiments/E1_filtered_delta_opd/data/virl39k_loader.py` | ViRL39K parquet streamer with PassRate filter, `<image>` strip, `\boxed{}` extraction, single-image filter. | ✅ 11,847 eligible rows; server-side smoke test 5/5 image loads OK. |
+| `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` | Per-sample teacher dual forward (image + null) + delta_t. Reuses E0 helpers via sys.path injection. **v1 use: only sample-level `trajectory_pass` + `gold`. Per-token data is wrong-trajectory (will be recomputed online).** | ✅ Smoke 10/10 records, 5/10 `trajectory_pass`, delta_t mean=0.259 / median=0.001 — sparse signal reproduced from E0. |
+| `experiments/E1_filtered_delta_opd/src/losses.py` | 4 verl-registered losses named `e1_offline_weighted_sft_*`. Math: `-student_logp × delta × pass_mask`. **Smoke baseline only — NOT E1 results.** | ✅ Local unit-tests 5/5 passed. |
+| `experiments/E1_filtered_delta_opd/src/spike_vllm_dual_forward.py` | Verifies vLLM multimodal + `prompt_logprobs=K` on Qwen2.5-VL-32B. | ✅ Server-side: K=50 verified after `max_logprobs=K` engine fix; **position-50 in K12-1000-0 showed killer delta signal** (image: `geometric/triangle/geometry/几何`; null: `completely/solid/plain/blank`). |
+| `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` | **Canonical design for Stage 2.** Per-prompt loop with KL branch + CE-on-gold branch; cost model; loss math; delta normalization; per-batch monitoring; engineering staged plan; risks. | ✅ Written; referenced from CLAUDE.md new-session reading list. |
+| `experiments/E1_filtered_delta_opd/README.md` | Major rewrite: on-policy explicit; 4-config A/B/C/D renamed; delta normalization; off-policy smoke baseline section; updated engineering punch list. | ✅ |
+| `docs/migrate-env.md` | New env-troubleshooting runbook. Q1-Q4 are existing NGC traps; **Q5 is new**: triton ldconfig UnicodeDecodeError on HPC-X machines (dev box 1). | ✅ |
+| `activate.sh.template` | Added detect-only check for Q5 (warns, never auto-patches). | ✅ |
+| `CLAUDE.md` | Pointer to `docs/migrate-env.md`; on_policy_v1_design.md added to new-session reading list. | ✅ |
+
+### Spikes done
+
+- **Spike A — verl recipe**: `verl/recipe/gkd/` is Megatron-only, single-condition teacher, no multimodal. Not a fit. `verl/trainer/distillation/` (FSDP) + `verl/utils/dataset/rl_dataset.py` (multimodal) is the right backbone.
+- **Spike B — verl on-policy infra**: `verl/experimental/agent_loop/agent_loop.py` already does rollout → teacher logp → DataProto. `AsyncTeacherLLMServerManager` already accepts `multi_modal_data["images"]`. **We just subclass the agent loop and call the teacher twice (image + null) per sample. No verl source edits.**
+- **Spike C — vLLM dual-forward (the precondition for Spike B)**: Triton + HPC-X env bug fixed with one-line sed on triton driver.py (`.decode("utf-8", errors="ignore")`). vLLM `LLM(..., max_logprobs=50)` then accepts `SamplingParams(prompt_logprobs=50)`. Multimodal works. Position-50 demo shows clean image-vs-null divergence — exactly the delta signal we want to upweight.
+
+### What is NOT in Day 1 (deferred to Stage 2+)
+
+- `src/on_policy/agent_loop.py` (the dual-forward subclass) — 1 day code work
+- `src/on_policy/losses.py` (4 on-policy KD wrappers) — same
+- `configs/recipe_*.yaml` — 4 YAML configs
+- `data/pope_style_builder.py` — Day 2
+- `data/tallyqa_loader.py` — Day 2
+- `data/synthesize_counterfactuals.py` — Day 2
+- `data/dedup_check.py` — Day 2
+- `data/mixture.py` + `make_train_parquet.py` — Day 3
+- `src/eval_tei.py` — Day 3-4
 
 ---
 
@@ -151,10 +206,17 @@ See **CLAUDE.md → Environment setup (NGC machine specifics)** for the canonica
 
 These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 
-- **Option scoring is raw `sum(log p)`** over the option's tokens. When `ground_truth` and `expected_bias` tokenize to different lengths, `gain_margin` has a length bias. For VLMBias `main` the strings are short (single-word / digit), so this is plausibly 2nd-order — but real. Fix scheduled for E1 baseline.
-- **All-black null image** could itself be OOD for the vision encoder, inflating KL. Step-2 ablation will compare with `image_drop`, Gaussian noise, and an unrelated-but-natural image.
+- ~~**Option scoring is raw `sum(log p)`**~~ ✅ **Resolved 2026-05-12 (E0.3-B)** — `metrics.py` now reports raw + length-normalized; per-topic direction stable, no sign flips.
+- **All-black null image** could itself be OOD for the vision encoder, inflating KL. Step-2 ablation will compare with `image_drop`, Gaussian noise, and an unrelated-but-natural image. **Note for on-policy v1**: `delta_t` at training time is on student rollout prefixes (not teacher's), so the same caveat applies — monitor `delta_t` distribution on student rollouts vs E0's teacher-prefix numbers.
 - **PPL-based student metrics** not computed yet (would need another server run, ~15 min on 7B).
 - **72B teacher sanity** not run yet.
+
+### Day-1 lessons surfaced today
+
+- **OPD is on-policy in the modern literature** (Thinking Machines, verl GKD recipe). PROGRESS.md and CLAUDE.md initially had "off-policy" as a typo; chain-of-error caused the first cuts of `precompute_teacher.py` and `losses.py` to be built for off-policy. Both are now reframed as smoke baselines; on-policy v1 design is the new canonical (see `on_policy_v1_design.md`).
+- **vLLM caps `prompt_logprobs` at `max_logprobs` (default 20)**. For K=50 (our E0 default), engine must be constructed with `max_logprobs=50`. Bake into teacher serving config.
+- **HPC-X clusters break triton ldconfig** (Q5 in `docs/migrate-env.md`). `activate.sh.template` now detects + warns. Dev box 1 is affected; dev box 3 is not.
+- **ViRL39K answer canonicalization**: `\boxed{4 - 3 = 1}` style answers are common (~89/12K filtered out had no `\boxed{}` at all; rest are mostly well-formed). E1's `verifier_pass` extracts trailing number/letter — passes 12/12 local unit tests including math expression vs digit match.
 
 ---
 
@@ -165,10 +227,21 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | `d7af8a3a` | Initial commit: experiment repo skeleton with verl submodule. |
 | `41050aa3` | NGC server env conventions docs (`activate.sh.template`, three-layer commit workflow). |
 | `d5113404` | E0 plan locked in CLAUDE.md (datasets, models, metrics, go/kill). |
-| `909c19d4` | E0 forward-only diagnostic skeleton (configs + loaders + dual_forward + metrics + scripts). |
+| `909c19d4` | E0 forward-only diagnostic skeleton. |
 | `e749ca99` | Fix `torch_dtype` deprecation + per-topic VLMBias gain_margin in metrics. |
 | `4fbbecc6` | Rich "Conditional GO" verdict + per-topic top-token dedup + analysis/e0_report.py. |
-| **`c9615363`** | E0.3 fixes: 5a answer-extraction bug fix + per-topic 5a + chance baseline + 5a wording softened + E1 design doc. **← current HEAD** |
+| `c9615363` | E0.3 fixes: 5a answer-extraction bug fix + per-topic 5a + chance baseline. |
+| `403ede29` | Added PROGRESS.md / NEXT.md handoff system. |
+| `70aac08a` | E0.3-B (length-norm gain_margin) + E1 4-config swap (SFT → Correct-filtered OPD). |
+| `7413dd54` | E1 mixture decisions locked + ViRL39K loader + verl backbone choice (FSDP). |
+| `1234a472` | E1 `precompute_teacher.py` first cut + `losses.py` stub. |
+| `f0ef23d9` | Fix E1 `precompute_teacher.py` cross-experiment import path. |
+| `1d358661` | Fix: OPD = on-policy, not off-policy (typo across project docs). |
+| `3c7ba382` | E1 pivot to on-policy v1 design; reframe off-policy code as smoke baseline. |
+| `0afa00d6` | Add `on_policy_v1_design.md` to new-session reading list. |
+| `eac27504` | E1 spike: vLLM multimodal + `prompt_logprobs=K` verification script. |
+| `5bd282cf` | `docs/migrate-env.md` runbook; `activate.sh` detects triton ldconfig bug (Q5). |
+| **`f84fc00b`** | Fix(spike): raise vLLM `max_logprobs` to match K. **← Day 1 HEAD** |
 
 ---
 
@@ -179,8 +252,14 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | Project-level instructions, conventions, env setup, datasets | `CLAUDE.md` |
 | This file — what's been done | `PROGRESS.md` |
 | What's next, decisions to make | `NEXT.md` |
-| Canonical scientific verdict | `experiments/E0_image_null_delta/results/e0_verdict.md` |
+| **Environment troubleshooting runbook (Q1-Q5)** | `docs/migrate-env.md` |
+| Canonical E0 verdict | `experiments/E0_image_null_delta/results/e0_verdict.md` |
 | Detailed metric table | `experiments/E0_image_null_delta/results/e0_summary.csv` |
 | Token category data for metric 4 | `experiments/E0_image_null_delta/results/top_delta_tokens.json` |
 | Figures (if matplotlib installed locally) | `experiments/E0_image_null_delta/results/figures/` |
-| E1 plan / design / open questions | `experiments/E1_filtered_delta_opd/README.md` |
+| E1 design / 4-config matrix / mixture / engineering punch list | `experiments/E1_filtered_delta_opd/README.md` |
+| **E1 on-policy v1 trainer design (canonical for Stage 2)** | `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` |
+| E1 bucket-1 loader (ViRL39K) | `experiments/E1_filtered_delta_opd/data/virl39k_loader.py` |
+| E1 offline precompute (smoke + sample-level signals) | `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` |
+| E1 smoke-baseline losses (NOT scientific results) | `experiments/E1_filtered_delta_opd/src/losses.py` |
+| vLLM dual-forward verification script | `experiments/E1_filtered_delta_opd/src/spike_vllm_dual_forward.py` |

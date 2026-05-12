@@ -1,7 +1,7 @@
 # NEXT — what to do next
-*Last updated: 2026-05-12 (morning). Pair this file with `PROGRESS.md`.*
+*Last updated: 2026-05-12 (evening, end of Day 1). Pair this file with `PROGRESS.md`.*
 
-> **For new Claude sessions:** if you're starting fresh, first read `CLAUDE.md`, then `PROGRESS.md` (what we did), then this file. Recommended next concrete action is at **§ Right now, today** below.
+> **For new Claude sessions:** if you're starting fresh, first read `CLAUDE.md`, then `PROGRESS.md` (what we did), then this file. Recommended next concrete action is at **§ Right now, Stage 2** below.
 
 ---
 
@@ -9,76 +9,85 @@
 
 ```
 E0 (forward-only diagnostic)   : DONE — Conditional GO
-E0.x (optional cleanup)        : pending, low priority
-E1 (training)                  : design doc exists, code NOT started
-E2 (mask sensitivity ablation) : not started
+E0.3-A (per-topic m5a)         : DONE
+E0.3-B (length-norm gain)      : DONE — per-topic direction stable
+E0.3-C (PPL_S smoke)           : deferred (does not block E1)
+E1 design                      : DONE — locked on-policy v1 with 4 configs A/B/C/D
+E1 Day 1                       : DONE — bucket-1 loader, smoke precompute, verl spike,
+                                  vLLM dual-forward verified, runbook for env Q5
+E1 Stage 2 (on-policy code)    : NEXT — agent_loop subclass + 4 losses + 4 yaml configs
+E2 (mask sensitivity)          : not started
 ```
 
 ---
 
-## Right now, today (the literal next thing to do)
+## Right now, Stage 2 (on-policy v1 trainer code)
 
-0. ✅ **E0.3-B done (2026-05-12).** Length-normalized `gain_margin` added to
-   `metrics.py` (boundary-trick token count via `"\n" + option`). Re-aggregated
-   on existing jsonls with `--tokenizer-path Qwen/Qwen2.5-VL-7B-Instruct`.
+Day 1 verified all preconditions. Stage 2 is **writing the on-policy training
+loop**. Estimated 1 full day. **Best done in a fresh Claude session** (this
+session has covered many topic shifts — fresh context for code work).
 
-   **Result: per-topic direction is stable. No sign flips.**
-   - Topics with same-length option pairs (Optical Illusion, Patterned Grid,
-     Logos, Animals) — numbers unchanged.
-   - Multi-token-option topics (Flags / Chess Pieces / Game Boards) — magnitude
-     shrunk 20–31% but **same sign**: Flags -2.60 → -1.80, Chess -2.80 → -2.09,
-     Game Boards -3.90 → -3.14.
-   - Global: -1.82 → -1.63, still fail.
+Read in order before writing code:
+1. `CLAUDE.md` (top 6 reading list — includes on_policy_v1_design.md)
+2. `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` (the **canonical
+   design** for what Stage 2 must build; see § "Engineering path")
+3. `experiments/E1_filtered_delta_opd/README.md` § Configs / Loss specs
 
-   **Conclusion: E1 motivation is not a length-bias artifact. No reframing
-   needed. Proceed to E1.**
+Concrete deliverables (in suggested order):
 
-   Run command to reproduce:
-   ```bash
-   python experiments/E0_image_null_delta/src/metrics.py \
-       --results-dir experiments/E0_image_null_delta/results \
-       --tokenizer-path Qwen/Qwen2.5-VL-7B-Instruct
-   ```
+1. **`src/on_policy/agent_loop.py`** — subclass `verl.experimental.agent_loop.SingleTurnAgentLoop`,
+   override `_compute_teacher_logprobs` to make TWO teacher calls (image and
+   null, with `multi_modal_data["images"]` swapped) and compute per-token
+   `delta_t = KL_topK(P_T^I || P_T^null)` locally. Reuse E0's
+   `kl_topk_union` for the math. ~120 LoC.
 
-1. **Verify the overnight ViRL39K download on the server.**
+2. **`src/on_policy/losses.py`** — register 4 on-policy losses with verl's
+   `@register_distillation_loss`:
+   - `e1_onpolicy_vanilla_kd` — `KL_topK(P_T^I || P_S)` (wraps verl's existing
+     `compute_forward_kl_topk`)
+   - `e1_onpolicy_raw_delta_kd` — same × `data["delta_t_normalized"]`
+   - `e1_onpolicy_filtered_kd` — KL branch on `trajectory_pass=1`; CE-on-gold branch on `trajectory_pass=0`
+   - `e1_onpolicy_filtered_delta_kd` — KL × delta on `trajectory_pass=1`; CE-on-gold on `trajectory_pass=0`
 
-   ```bash
-   ssh into arc-wlf1-ge103-4
-   tmux a   # or new pane
+   delta normalization: `clip(delta_t, p95) / mean(clip)` per batch.
+   CE-on-gold dispatch: per-sample branch based on a precompute-time-set
+   `loss_branch` field in the data row ("kl" or "ce"). See
+   on_policy_v1_design.md § 3 and § 6 for the full math.
 
-   cd /home/web_server/antispam/project/houshihao/datasets
-   ls -lah ViRL39K/
-   tail -20 viRL39K_download.log
+3. **`src/on_policy/trainer.py`** — thin wrapper that registers our agent loop
+   + losses, then delegates to verl's FSDP distillation trainer. Loads the
+   precompute parquet + multimodal dataset via `verl.utils.dataset.rl_dataset.RLHFDataset`.
 
-   # If huggingface-cli download succeeded, you should see arrow files / metadata.
-   # If it failed (auth issue, disk full, etc.), restart with the same command:
-   #   nohup huggingface-cli download TIGER-Lab/ViRL39K \
-   #       --repo-type dataset --local-dir ./ViRL39K \
-   #       > viRL39K_download.log 2>&1 &
-   ```
+4. **`configs/recipe_*.yaml`** — 4 YAMLs (one per config). Each overrides:
+   - `distillation.distillation_loss.loss_mode` → one of the 4 registered names
+   - `distillation.distillation_loss.topk` → 50
+   - `distillation.teacher_models.<key>.inference.max_logprobs` → 50 (see
+     spike Q below)
+   - `actor_rollout_ref.rollout.agent_loop_class` → our DeltaOPDAgentLoop
 
-2. **Inspect ViRL39K schema** so we know what the loader needs to do:
+5. **`src/on_policy/smoke.sh`** — 1K-subset, 100-step smoke run; confirms
+   rollout → dual teacher → loss → backward → checkpoint cycle.
 
-   ```bash
-   python <<'PY'
-   from datasets import load_from_disk
-   ds = load_from_disk("/home/web_server/antispam/project/houshihao/datasets/ViRL39K")
-   print(type(ds), ds)
-   first = ds[0] if hasattr(ds, "__getitem__") else next(iter(ds.values()))[0]
-   print(list(first.keys()))
-   print({k: type(v).__name__ for k, v in first.items()})
-   PY
-   ```
+### Stage 2 prerequisites already satisfied (don't re-spike)
 
-   Likely keys (from TIGER-Lab/ViRL39K HF card, **verify**): question, image, answer, source. Confirm before writing the loader.
+- ✅ vLLM multimodal + `prompt_logprobs=K` on Qwen2.5-VL-32B verified
+  (`spike_vllm_dual_forward.py` passed; position-50 in K12-1000-0 showed
+  clean delta signal: image="geometric/triangle" vs null="completely/solid/plain")
+- ✅ verl FSDP distillation has 80% of what we need; subclass agent_loop, no
+  verl source edits required (Spike B)
+- ✅ Triton ldconfig env bug fixed and documented (`docs/migrate-env.md § Q5`);
+  activate.sh detects on future machines
+- ✅ ViRL39K bucket-1 loader DONE and smoke-tested (11,847 eligible rows)
+- ✅ E1 design pivoted to on-policy after external review; 4-config matrix
+  locked as A/B/C/D (VanillaKD / RawDeltaKD / FilteredKD / FilteredDeltaKD)
 
-3. **Decide verl recipe entry point** for E1. See `experiments/E1_filtered_delta_opd/README.md` for context. Open options:
+### Stage 2 known-issue heads-up
 
-   - `verl/recipe/gkd/` — general knowledge distillation; closest match conceptually.
-   - `verl/trainer/distillation/{fsdp,megatron}/losses.py` — primitive reverse-KL utilities.
-   - Roll a thin custom trainer wrapping `verl.trainer.sft_trainer`.
-
-   Spike each for 30 min, then commit to one. Don't write significant code without picking one first.
+- **`max_logprobs=K` engine arg**: the spike learned that vLLM caps
+  `prompt_logprobs` at 20 by default. Teacher serving config in Stage 2 must
+  also set `max_logprobs=50` (or whatever K we use). Bake into `recipe_*.yaml`.
+- **Triton patch is venv-local** and gets overwritten by triton reinstalls.
+  If `pip install -U triton` runs in Stage 2, re-apply the Q5 sed.
 
 ---
 
@@ -86,8 +95,8 @@ E2 (mask sensitivity ablation) : not started
 
 | Task | Status | Cost | Why |
 |---|---|---|---|
-| **E0.3-A: per-topic m5a + chance-normalized overlap** | ✅ **DONE** (`c9615363`; table in `e0_verdict.md` § Student/teacher overlap) | — | Was needed because global 72.9% same-wrong was a mix of mechanical binary-task ceiling and real shared prior. Now broken out per topic with `excess_over_chance`. |
-| **E0.3-B: Length-normalized `gain_margin`** | ⏳ **Promoted to "Right now, today" item #0** (E1 blocker) | Add Qwen tokenizer load in `metrics.py`; ~30 lines; no rerun needed. | Eliminates length bias in `gain_margin`. **E1 motivation hinges on the per-topic table direction — must verify it survives normalization before training.** Will be reused as-is in E1 eval. |
+| **E0.3-A: per-topic m5a + chance-normalized overlap** | ✅ **DONE** (`c9615363`; table in `e0_verdict.md` § Student/teacher overlap) | — | Global 72.9% same-wrong was a mix of mechanical binary-task ceiling and real shared prior. Broken out per topic with `excess_over_chance`. |
+| **E0.3-B: Length-normalized `gain_margin`** | ✅ **DONE** (`70aac08a`) | ~30 LoC + `--tokenizer-path` Qwen2.5-VL-7B-Instruct. | Eliminated length bias. Result: per-topic direction stable, no sign flips. Multi-token-option topics' magnitudes shrunk 20-31%; same-length-option topics unchanged. E1 motivation intact. |
 | **E0.3-C: PPL_S(teacher_wrong_response \| x, I)** | Deferred, **does not block E1** | New ~15 min server run; new script `e0_ppl_student.py`. | Distribution-level overlap proxy. More OPD-faithful than answer-overlap. Useful as an E0 baseline before E1 trained students. Schedule when GPU is free. |
 | **72B teacher sanity** | Deferred | `bash experiments/E0_image_null_delta/scripts/run_e0_teacher72b_sanity.sh`; ~20 min on 2 H800. | Tells us if the failure modes scale away with larger teacher (probably no) or are property of architecture (probably yes). |
 | **Per-topic top tokens validation** | Deferred | Hand-inspect `top_delta_tokens.json["vlmbias_by_topic"]`; Logos has anomalous `" on"` token, decide if signal or noise. | Confirms metric 4 quality across topics, not just globally. |
@@ -98,29 +107,36 @@ E2 (mask sensitivity ablation) : not started
 
 **Read `experiments/E1_filtered_delta_opd/README.md` for the design.** That's the source of truth for the 4-config ablation, training-data composition, loss form, evaluation matrix, and engineering punch list. This section is the *workflow* on top of it.
 
-### 4-config matrix (recap from design doc)
+### 4-config matrix (recap from on_policy_v1_design.md)
+
+On-policy. Student rolls out at student's prefix `s_t`; teacher dual-scores
+(image + null) on the rollout to provide `top-K logp` + `delta_t`.
 
 | Config | What | Role |
 |---|---|---|
-| A. `vanilla_opd` | Student rollout + teacher reverse-KL full-prefix, no filtering, no delta | Existing-OPD baseline |
-| B. `raw_delta_opd` | `Σ_t delta_t · KL(p_T \|\| p_S)`, no filtering | **Negative control** — tests "image influence alone is insufficient" |
-| C. `correct_filtered_opd` | `1[T_correct] · Σ_t KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Critical control** — isolates filtering's contribution. Without this, D's gains could be from filtering alone. |
-| D. `correct_filtered_delta_opd` | `1[T_correct] · Σ_t delta_t · KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Primary candidate** — filtering + delta. |
+| A. `VanillaKD` | `Σ_t KL_topK(P_T^I(.|s_t) \|\| P_S(.|s_t))`, no filter, no delta | Existing-OPD baseline |
+| B. `RawDeltaKD` | `Σ_t w_t · KL_topK`, `w_t = clip(delta_t, p95)/mean`, no filter | **Negative control** — tests "image influence alone is insufficient" |
+| C. `FilteredKD` | KL branch on `T_correct=1`; CE-on-gold on `T_correct=0` | **Critical control** — isolates filtering+CE contribution |
+| D. `FilteredDeltaKD` | KL × delta on `T_correct=1`; CE-on-gold on `T_correct=0` | **Primary candidate** |
 
-Compute-budget fallback: drop B (Raw Delta-OPD) first, keep A+C+D. **Do NOT drop C** — without the filtering-only control, D's gains are unattributable.
+Central comparisons: **B vs A** (does raw delta hurt?), **D vs C** (does
+delta help given filtering?), **C vs A** (how much is just filtering+CE?).
 
-SFT (`L = −log p_S(y_T | x, I)`) is deferred to optional E1.5 — different question, not part of the core method validation.
+Compute-budget fallback: drop B first, keep A+C+D. **Do NOT drop C** —
+without it D's gains are unattributable.
 
-### Day-by-day (rough)
+SFT (`L = −log p_S(y_T | x, I)`) deferred to optional E1.5.
 
-| Day | Goal |
-|---|---|
-| **Today (Day 1)** | E0.3-B done (item #0 above); ViRL39K verified + verl recipe picked + multimodal loader for ViRL39K + outline of `precompute_teacher.py`. |
-| Day 2 | Implement `precompute_teacher.py`; run on a 500-sample slice to sanity-check teacher correctness rate; if <30% correct, ViRL39K isn't the right primary bucket. |
-| Day 3 | Implement Vanilla OPD trainer (or thin wrapper); smoke-test on 1K samples, 100 steps. |
-| Day 4 | Implement Raw Delta-OPD + Correct-filtered OPD + Correct-filtered Delta-OPD (shared filtering/CE plumbing — build together). Eval hooks. |
-| Day 5 | Full 4-config sweep on ~8K-sample E1-mini; first eval. |
-| Day 6 | Decide v2 hyperparameters. |
+### Day-by-day (updated 2026-05-12 evening)
+
+| Day | Status | Goal |
+|---|---|---|
+| **Day 1 (2026-05-12)** | ✅ done | E0.3-B; on-policy pivot; ViRL39K verified + loader; precompute_teacher.py (smoke); losses.py (smoke-baseline only); 3 spikes (verl FSDP, verl on-policy, vLLM dual-forward); env Q5 runbook; on_policy_v1_design.md. |
+| **Day 1.5 (next)** | pending | Stage 2 of on_policy_v1_design.md — agent_loop subclass + losses + 4 yaml configs. Smoke-test on 1K. |
+| Day 2 | pending | Build bucket 2 (POPE-style on COCO train) + bucket 3 (synthesis + TallyQA). Dedup pipeline. Freeze 8K E1-mini mixture. |
+| Day 3 | pending | `make_train_parquet.py`; run precompute on the 8K mixture (sample-level trajectory_pass + gold tokenize only — drop the per-token forced-score path; v1 doesn't use it). |
+| Day 4 | pending | Full 4-config sweep on 8K E1-mini, on-policy. |
+| Day 5 | pending | First eval (TEI / Escape / per-topic gain_margin); decide v2 hyperparameters. |
 
 ### Evaluation harness (must exist before launching training)
 
@@ -149,30 +165,45 @@ Delta-weighting might amplify object-token attention, which could raise `yes`-ra
 
 ---
 
-## Open questions that need decisions BEFORE writing significant E1 code
+## Open questions — most resolved 2026-05-12; one remaining for Stage 2
 
-| # | Question | How to decide |
+| # | Question | Status |
 |---|---|---|
-| 1 | verl recipe entry point: `recipe/gkd/` vs thin wrapper? | Spike each for 30 min. Prefer GKD if it already has multimodal data plumbing wired. |
-| 2 | Online teacher forward vs precomputed teacher logits? | If memory allows 7B+32B on 8 H800 → online. If not → precompute top-K teacher logits + delta_t per training sample once, cache to disk, replay during training. |
-| 3 | ViRL39K starter subsample size? | 8K for E1-mini. Scale later. |
-| 4 | Where to find adversarial-recognition counterfactuals (NOT VLMBias eval)? | Look at TallyQA, TangramQA, possibly synthesize custom modified-object samples. Decide after Day 1 spike. |
-| 5 | `λ_ans` (CE weight on gold for `correct_filtered_*` configs when teacher is wrong)? | Start at 1.0 — same scale as KL. Sweep in v2. |
-| 6 | Top-K for KL in training (vs E0's 50)? | 50 by default for continuity, but consider 100 to reduce truncation bias. Document the choice. |
+| 1 | verl recipe entry point | ✅ Resolved. **verl `trainer/distillation/` FSDP** + `utils/dataset/rl_dataset.py` for multimodal + subclass `verl/experimental/agent_loop/SingleTurnAgentLoop` for dual-forward. NOT `recipe/gkd/` (Megatron-only). |
+| 2 | Online teacher forward vs precomputed | ✅ Resolved. **Online** for per-token `teacher_logp` + `delta_t` (on student rollout prefix, can't precompute). **Precomputed** for sample-level `trajectory_pass` + `gold_token_ids` (precompute_teacher.py output). |
+| 3 | ViRL39K starter subsample size | ✅ 8K E1-mini. Stratified by category from the 11,847 PassRate-filtered single-image rows. |
+| 4 | Adversarial-recognition counterfactual source | ✅ Resolved post-GPT-review: synthesis-primary (~1500 VLMBias-like) + TallyQA complex (~900). NOT VLMBias `withtitle`/`remove_background` (image leakage with `main` eval). |
+| 5 | `β` (CE weight on gold for filtered configs) | Start at 1.0. Sweep in v2. |
+| 6 | Top-K for KL in training | 50 (matches E0). vLLM teacher serving needs `max_logprobs=50` in engine config (spike learning). |
+| **7** | **CE-on-gold dispatch implementation** | **Open for Stage 2.** Trainer-level sub-batch split (route by `loss_branch`) vs in-loss per-sample branching. Per `on_policy_v1_design.md § 6`, precompute pre-bakes `response_token_ids` per sample (teacher's response for KL samples, gold tokens for CE samples) so the loss is just `if data["loss_branch"] == "ce": NLL; else: KL_topK * weights`. |
 
 ---
 
 ## Hard rules — **DO NOT**
 
-1. **Don't launch training without E0.3-B done.** If length-normalized `gain_margin` flips the per-topic direction in `e0_verdict.md`, the E1 motivation needs reframing. Cheap local check; do it first.
-2. **Don't launch training without a recipe decision** (open question #1). You'll waste GPU hours debugging integration.
-3. **Don't drop Correct-filtered OPD (Config C) from the 4-config sweep.** Without it, gains in D are unattributable. If compute-constrained, drop Raw Delta-OPD (B) instead.
-4. **Don't generate teacher data on the VLMBias eval set.** That's evaluation, not training. Use held-out adversarial-recognition data only.
-5. **Don't change the null mode** (still only `black`) until E2 ablation. Changing it mid-experiment poisons cross-run comparisons.
-6. **Don't `pip install -e` anything without `--no-deps`** on the server. Rebuilding TransformerEngine costs 30–40 minutes.
+1. **Don't fall back to off-policy weighted CE as the E1 main experiment.**
+   It's mathematically defensible as a smoke baseline only. The actual E1
+   experiment uses on-policy student rollouts + dual teacher scoring — that
+   is what "OPD" means. The `e1_offline_weighted_sft_*` losses are smoke;
+   never report them as E1 results.
+2. **Don't drop `FilteredKD` (Config C) from the 4-config sweep.** Without
+   the filtering-only control, any gain in D is unattributable to delta.
+   If compute-constrained, drop `RawDeltaKD` (B) instead.
+3. **Don't generate teacher data on the VLMBias eval set.** That's
+   evaluation, not training. Use held-out adversarial-recognition data only.
+4. **Don't use VLMBias `withtitle` / `remove_background_*` subsets for
+   training** — they share base images with `main` (the eval set). Image
+   leakage.
+5. **Don't change the null mode** (still only `black`) until E2 ablation.
+6. **Don't `pip install -e` anything without `--no-deps`** on the server.
+   Rebuilding TransformerEngine costs 30–40 minutes.
 7. **Don't touch `.venv` symlink** on the server.
-8. **Don't share the server** with other tenants during E1 training. Coordinate.
-9. **Don't trust same-wrong overlap rate as a primary signal** — it conflates baseline shared prior with potential distillation effect. Use the TEI metric family instead.
+8. **Don't share the server** with other tenants during E1 training.
+9. **Don't trust same-wrong overlap rate as a primary signal** — use TEI
+   metric family.
+10. **Don't `pip install -U triton` without re-applying the Q5 sed patch
+    afterward** on HPC-X machines (see `docs/migrate-env.md § Q5`).
+    `activate.sh` warns at startup if the patch was overwritten.
 
 ---
 
