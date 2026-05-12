@@ -101,19 +101,18 @@ If FAIL: do NOT proceed to Step 3. Either fix the synth pipeline (CLIP-guided / 
 
 **Step 3 — 1K mini-sweep (8 GPUs, ~1.5h total for A/B/C/D)**
 
-Subsample the 8K mixture to 1K (same per-bucket ratio), run A/B/C/D × ~50 steps each, extract metrics, merge checkpoint, run eval_tei. Look at **direction**, not magnitude.
+Subsample the 5.5K Plan-C mixture to 1K (700/300 ≈ same ratio), run A/B/C/D × ~50 steps each, extract metrics, merge checkpoint, run eval_tei. Look at **direction**, not magnitude.
 
 ```bash
-# 3a. Build a 1K mini parquet (sample 1/8 from the 8K). The simplest path
-#     is to re-run `mixture.py` with the per-bucket counts scaled down:
+# 3a. Plan C: 1K mini from ViRL39K + synth only. POPE/TallyQA buckets
+#     skipped — Safety metric is still measured via POPE-adv eval inference,
+#     just not via in-training POPE supervision.
 python -m experiments.E1_filtered_delta_opd.data.mixture \
     --output $DATASETS/e1_mini_v1/mixture_1k.jsonl \
-    --virl39k-root $DATASETS/ViRL39K --coco-train-root $DATASETS/coco \
-    --pope-adv-root $DATASETS/POPE-adversarial \
-    --tallyqa-json $DATASETS/tallyqa/train.json \
-    --tallyqa-images-root $DATASETS/tallyqa_images \
+    --virl39k-root $DATASETS/ViRL39K \
     --synth-dir $DATASETS/e1_synth_v1 \
-    --n-virl39k 500 --n-pope-style 200 --n-tallyqa 112 --n-synthetic 188
+    --n-virl39k 700 --n-synthetic 300 \
+    --skip pope_style tallyqa
 
 # 3b. Precompute teacher on the 1K (~10 min, 8 shards)
 for SHARD in 0 1 2 3 4 5 6 7; do
@@ -186,25 +185,72 @@ After all 4 configs finish, compare them by directly diffing the 4 `eval_1k_{A,B
 
 If 1K shows zero direction, 8K probably won't either — diagnose before scaling up.
 
-**Step 4 — 8K full sweep (only after 1-3 pass)**
+**Step 4 — Plan A upgrade (only after Plan-C 1-3 pass with the right direction)**
 
-Then run the originally-planned full pipeline: COCO/TallyQA download → synth → mixture → dedup → 32B precompute on 8K → parquet → 4-config sweep → full eval. Commands at the bottom of this section.
+If Plan C confirms B/C/D move correctly against A but Safety (POPE / MathVista) regressed visibly, OR if the absolute deltas are too small to call confidently, scale to full 8K Plan A: add bucket 2 (POPE-style on COCO train) + bucket 3b (TallyQA complex) to the mixture, re-run precompute, retrain. Commands at the bottom of this section. The data downloads (~40 GB) can run in tmux in the background while Plan C is going.
 
 ### Day-3 prerequisites (any order)
 
-- **Commit Day-2 code** (10 files; see § "How to resume").
-- **Server**: COCO train2017 + annotations (~18 GB) + TallyQA train.json + image dir.
-- **Server**: `pip install --no-deps imagehash open_clip_torch` (dedup deps; lazy-imported but needed at run time).
-- **Local**: copy E0 32B-teacher VLMBias jsonls from server → Mac (`experiments/E0_image_null_delta/results/e0_teacher32b_vlmbias_shard_*.jsonl`) so `eval_tei.py` unit tests have a real T_wrong fixture.
+**Plan C — minimal 5.5K mixture (ViRL39K + synth only, no COCO/TallyQA bucket).**
+This is the direction-test path: just enough to see whether B/C/D move the
+right way against A on the eval metrics. POPE-adv + MathVista are still
+*evaluated* (Safety bucket), they're just not in training.
 
-### Step-4 command reference (run only after Step 3 passes)
+- **Already committed** (origin/main): all 12 Day-2/3 files + 2 day-3 tools.
+- **Server**: ViRL39K + Qwen2.5-VL-7B/32B already on disk per CLAUDE.md.
+- **Server**: `pip install --no-deps imagehash open_clip_torch` only if you
+  later want to upgrade to Plan A and need dedup against COCO/VG.
+- **Local Mac (already done in this session)**: E0 jsonls already on disk
+  for eval_tei.py self-test (uses them as the canonical T_wrong fixture).
+
+**Plan A upgrade** (later — when Plan C confirms direction): download
+COCO 2014 + Visual Genome 100K + TallyQA JSONs (~40 GB). See § "Plan A
+upgrade — full 8K mixture" at the bottom of this section.
+
+### Plan A upgrade — full 8K mixture (run only after Plan C 1-3 pass)
+
+Plan A adds bucket 2 (POPE-style on COCO train2017) and bucket 3b (TallyQA
+complex). The data downloads are the only extra prerequisite vs Plan C —
+once on disk, the same scripts handle them.
+
+**Data downloads (~40 GB; tmux it in the background while Plan C runs)**:
 
 ```bash
-# Synth build (~5 min, no GPU)
+# Run all this in a tmux session — no foreground attention needed
+mkdir -p $DATASETS/tallyqa $DATASETS/tallyqa_images && cd $DATASETS/tallyqa
+
+# 1. TallyQA JSON metadata (small, instant): the "complex" tag lives inside train.json
+git clone https://github.com/manoja328/TallyQA_dataset.git . || git pull
+
+# 2. COCO 2014 images (TallyQA references COCO_train2014_*.jpg / COCO_val2014_*.jpg).
+#    These are DIFFERENT files from COCO 2017 (same IDs, different filenames). Easiest:
+#    just download COCO 2014 alongside the COCO 2017 you already have.
+cd $DATASETS/tallyqa_images
+wget -c http://images.cocodataset.org/zips/train2014.zip   # ~13 GB
+wget -c http://images.cocodataset.org/zips/val2014.zip     # ~6 GB
+unzip -q train2014.zip && unzip -q val2014.zip
+rm train2014.zip val2014.zip
+
+# 3. Visual Genome 100K images (TallyQA's VG subset references VG_100K/<id>.jpg)
+wget -c https://cs.stanford.edu/people/rak248/VG_100K/images.zip      # ~9 GB (VG_100K)
+wget -c https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip    # ~5 GB (VG_100K_2)
+unzip -q images.zip      # → VG_100K/
+unzip -q images2.zip     # → VG_100K_2/
+# tallyqa_loader looks for images relative to tallyqa-images-root; the loader's
+# `image` field in train.json is like "VG_100K/2316634.jpg" so the structure
+# after unzip is correct.
+rm images.zip images2.zip
+echo "TallyQA images ready."
+```
+
+After downloads finish, the Plan A pipeline:
+
+```bash
+# Synth already built in Plan C Phase 0 — skip if so.
 python -m experiments.E1_filtered_delta_opd.data.synthesize_counterfactuals \
     --out-dir $DATASETS/e1_synth_v1 --n-samples 1500 --seed 42
 
-# Mixture manifest (~1-2 min, no GPU)
+# Full 8K mixture
 python -m experiments.E1_filtered_delta_opd.data.mixture \
     --output $DATASETS/e1_mini_v1/mixture.jsonl \
     --virl39k-root $DATASETS/ViRL39K --coco-train-root $DATASETS/coco \
@@ -215,7 +261,8 @@ python -m experiments.E1_filtered_delta_opd.data.mixture \
 
 # Dedup (MUST PASS, ~10-30 min, 1 GPU)
 python -m experiments.E1_filtered_delta_opd.data.dedup_check \
-    --pope-style-manifest '{...}' --tallyqa-manifest '{...}' \
+    --pope-style-manifest '{"coco_train_root":"'$DATASETS'/coco","annotations_path":"'$DATASETS'/coco/annotations/instances_train2017.json","pope_adv_root":"'$DATASETS'/POPE-adversarial","n_samples":1600}' \
+    --tallyqa-manifest '{"json_path":"'$DATASETS'/tallyqa/train.json","images_root":"'$DATASETS'/tallyqa_images","pope_adv_root":"'$DATASETS'/POPE-adversarial","n_max":900}' \
     --synth-dir $DATASETS/e1_synth_v1 \
     --pope-adv-root $DATASETS/POPE-adversarial \
     --vlmbias-root $DATASETS/VLMBias \
@@ -232,7 +279,7 @@ for SHARD in 0 1 2 3 4 5 6 7; do
     --shard-index $SHARD --num-shards 8 &
 done; wait
 
-# Build parquet (~min)
+# Build parquet
 python -m experiments.E1_filtered_delta_opd.data.make_train_parquet \
     --jsonl $RESULTS/e1_precompute_shard_*.jsonl \
     --student-tokenizer $MODELS/Qwen2.5-VL-7B-Instruct \
@@ -298,7 +345,8 @@ SFT (`L = −log p_S(y_T | x, I)`) deferred to optional E1.5.
 | **Day 1 (2026-05-12)** | ✅ done | E0.3-B; on-policy pivot; ViRL39K verified + loader; precompute_teacher.py (smoke); losses.py (smoke-baseline only); 3 spikes (verl FSDP, verl on-policy, vLLM dual-forward); env Q5 runbook; on_policy_v1_design.md. |
 | **Day 1.5 (2026-05-12 → 13)** | ✅ done | Stage 2 trainer code: agent_loop + 4 losses + parquet builder + launcher. All 4 configs (A/B/C/D) verified end-to-end on 50 ViRL39K. 5 integration traps surfaced + fixed (`docs/e1_smoke_runbook.md`). |
 | **Day 2 (2026-05-13)** | ✅ code done | Data pipeline: POPE-style / TallyQA / synth / dedup / mixture / multi-bucket parquet builder + multi-bucket precompute. 35 local unit tests pass. Awaiting commit + server data download. |
-| **Day 3** | NEXT | Commit Day 2 + download COCO/TallyQA → synth build → mixture → dedup gate → 32B teacher precompute on 8K (~1h shard-parallel) → parquet → B/C/D smoke on real mixture. |
+| **Day 3 (Plan C)** | NEXT | 5.5K mixture (ViRL39K + synth only; skip COCO/TallyQA bucket). Phase 0 build → Phase 1 baseline 7B eval → Phase 2 synth-bucket teacher sanity → Phase 3 1K mini-sweep + per-config eval_tei. TallyQA download runs in tmux background in parallel. |
+| **Day 3.5 (Plan A upgrade)** | conditional | After Plan C, if direction OK but Safety regressed or magnitudes too small, add bucket 2 (POPE-style) + bucket 3b (TallyQA) → retrain on 8K. Otherwise skip. |
 | Day 4 | pending | Full 4-config sweep on 8K E1-mini, on-policy. |
 | Day 5 | pending | First eval (TEI / Escape / per-topic gain_margin); decide v2 hyperparameters. |
 
