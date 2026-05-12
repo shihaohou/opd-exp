@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-RECIPE_LETTER=${1:?usage: $0 <A|B|C|D> ; pass which of the four recipes to run}
+RECIPE_LETTER=${1:?usage: $0 <A|B|C|D> [extra hydra overrides]}
 case "$RECIPE_LETTER" in
     A) RECIPE_NAME=recipe_A_vanilla_kd ;;
     B) RECIPE_NAME=recipe_B_raw_delta_kd ;;
@@ -21,6 +21,7 @@ case "$RECIPE_LETTER" in
     D) RECIPE_NAME=recipe_D_filtered_delta_kd ;;
     *) echo "Unknown recipe $RECIPE_LETTER (expected A|B|C|D)" >&2; exit 1 ;;
 esac
+shift  # consume the recipe letter so "$@" only carries Hydra-style key=value overrides
 
 # ---- Required: dataset parquets (output of precompute_teacher.py) ----
 : "${E1_TRAIN_PARQUET:?must point to the precomputed E1 train parquet}"
