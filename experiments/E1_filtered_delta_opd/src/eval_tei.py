@@ -583,13 +583,19 @@ def evaluate(
 # ===========================================================================
 
 def _load_e0_helpers():
-    """Lazy-import E0 dual_forward helpers and sample loaders."""
+    """Lazy-import E0 dual_forward helpers and sample loaders.
+
+    E0 loader names are `load_vlmbias` / `load_pope` / `load_mathvista`
+    (no `_adversarial` / `_mini` suffix). Both POPE and MathVista loaders
+    have non-None defaults for `n_samples` (1000 and 500), so passing
+    `n_samples=None` explicitly returns ALL rows in the on-disk dataset.
+    """
     from experiments.E0_image_null_delta.src.dual_forward import (
         greedy_generate, forced_score, score_option,
         options_for_sample, parse_correctness,
     )
     from experiments.E0_image_null_delta.data.loaders import (
-        load_vlmbias, load_pope_adversarial, load_mathvista_mini,
+        load_vlmbias, load_pope, load_mathvista,
     )
     return {
         "greedy_generate": greedy_generate,
@@ -598,8 +604,8 @@ def _load_e0_helpers():
         "options_for_sample": options_for_sample,
         "parse_correctness": parse_correctness,
         "load_vlmbias": load_vlmbias,
-        "load_pope_adversarial": load_pope_adversarial,
-        "load_mathvista_mini": load_mathvista_mini,
+        "load_pope": load_pope,
+        "load_mathvista": load_mathvista,
     }
 
 
@@ -866,10 +872,10 @@ def _cmd_infer(args: argparse.Namespace) -> int:
         samples_iter = helpers["load_vlmbias"](args.dataset_root, subset=args.subset or "main", n_samples=args.limit)
         ds_name = f"vlmbias_{args.subset or 'main'}"
     elif args.dataset == "pope":
-        samples_iter = helpers["load_pope_adversarial"](args.dataset_root, n_samples=args.limit)
+        samples_iter = helpers["load_pope"](args.dataset_root, n_samples=args.limit)
         ds_name = "pope_adversarial"
     elif args.dataset == "mathvista":
-        samples_iter = helpers["load_mathvista_mini"](args.dataset_root, n_samples=args.limit)
+        samples_iter = helpers["load_mathvista"](args.dataset_root, n_samples=args.limit)
         ds_name = "mathvista_mini"
     else:
         raise ValueError(f"unknown dataset {args.dataset!r}")
