@@ -868,22 +868,36 @@ def _cmd_infer(args: argparse.Namespace) -> int:
     helpers = _load_e0_helpers()
     model, processor = load_student_hf(args.checkpoint, dtype=args.dtype)
 
+    # When sharding, load ALL rows so the shard slicing covers the full dataset.
+    # `--limit` then caps each shard's own work (mostly useful for smoke).
+    loader_n = None if args.num_shards > 1 else args.limit
+
     if args.dataset == "vlmbias":
-        samples_iter = helpers["load_vlmbias"](args.dataset_root, subset=args.subset or "main", n_samples=args.limit)
+        samples_iter = helpers["load_vlmbias"](args.dataset_root, subset=args.subset or "main", n_samples=loader_n)
         ds_name = f"vlmbias_{args.subset or 'main'}"
     elif args.dataset == "pope":
-        samples_iter = helpers["load_pope"](args.dataset_root, n_samples=args.limit)
+        samples_iter = helpers["load_pope"](args.dataset_root, n_samples=loader_n)
         ds_name = "pope_adversarial"
     elif args.dataset == "mathvista":
-        samples_iter = helpers["load_mathvista"](args.dataset_root, n_samples=args.limit)
+        samples_iter = helpers["load_mathvista"](args.dataset_root, n_samples=loader_n)
         ds_name = "mathvista_mini"
     else:
         raise ValueError(f"unknown dataset {args.dataset!r}")
 
+    # Round-robin sharding (same scheme as precompute_teacher.py).
+    samples_list = list(samples_iter)
+    if args.num_shards > 1:
+        total = len(samples_list)
+        samples_list = samples_list[args.shard_index::args.num_shards]
+        logger.info(
+            "[shard] %d/%d → %d samples for shard %d",
+            len(samples_list), total, len(samples_list), args.shard_index,
+        )
+
     run_inference_on_dataset(
         model=model,
         processor=processor,
-        samples_iter=samples_iter,
+        samples_iter=samples_list,
         output_jsonl=Path(args.output),
         dataset_name=ds_name,
         max_new_tokens=args.max_new_tokens,
@@ -927,6 +941,11 @@ def parse_args() -> argparse.Namespace:
     pi.add_argument("--subset", default=None, help="(VLMBias only) sub-config; defaults to 'main'")
     pi.add_argument("--output", required=True, help="Output jsonl path")
     pi.add_argument("--limit", type=int, default=None, help="Cap samples (smoke)")
+    pi.add_argument("--shard-index", type=int, default=0,
+                    help="0-indexed shard (multi-GPU parallel). Round-robin from full dataset.")
+    pi.add_argument("--num-shards", type=int, default=1,
+                    help="Total shard count. Run N processes with different --shard-index "
+                         "on different CUDA_VISIBLE_DEVICES, then `cat shard*.jsonl > all.jsonl`.")
     pi.add_argument("--max-new-tokens", type=int, default=256)
     pi.add_argument("--top-k", type=int, default=50)
     pi.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
