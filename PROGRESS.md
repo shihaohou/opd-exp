@@ -7,7 +7,7 @@
 
 ## TL;DR
 
-- **Project**: Delta-OPD — off-policy distillation for VLMs reweighted by per-token image-vs-null teacher KL.
+- **Project**: Delta-OPD — on-policy distillation for VLMs reweighted by per-token image-vs-null teacher KL.
 - **Phase**: E0 (forward-only diagnostic) **complete**. E1 (training) **not yet started**, design doc exists at `experiments/E1_filtered_delta_opd/README.md`.
 - **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; the 2 that fail (delta-correctness correlation, gain_margin on VLMBias) fail in an *informative* way that constrains E1 method choice.
 - **Headline**: `delta_t` faithfully tracks image influence, but the *direction* of that influence is task-dependent — it's adversarial on VLMBias recognition topics. So the right E1 recipe is **Filtered Delta-OPD** (weight only on teacher-correct trajectories), with Raw Delta-OPD as negative-control ablation.

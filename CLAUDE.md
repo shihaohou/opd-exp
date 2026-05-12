@@ -7,7 +7,7 @@
 > 4. **[`experiments/E0_image_null_delta/results/e0_verdict.md`](experiments/E0_image_null_delta/results/e0_verdict.md)** — the canonical scientific verdict for E0.
 > 5. **[`experiments/E1_filtered_delta_opd/README.md`](experiments/E1_filtered_delta_opd/README.md)** — the design doc for the next experiment phase.
 
-This is the **experiment workspace** for Delta-OPD (off-policy distillation for VLMs guided by per-token image-vs-null teacher delta). It is *not* the verl framework repo; verl is a git submodule at `verl/`.
+This is the **experiment workspace** for Delta-OPD (on-policy distillation for VLMs guided by per-token image-vs-null teacher delta). It is *not* the verl framework repo; verl is a git submodule at `verl/`.
 
 ## Repo layout
 

@@ -1,6 +1,6 @@
 # opd-exp
 
-Experiment workspace for **Delta-OPD** — off-policy distillation for VLMs guided by per-token *image-vs-null* teacher delta.
+Experiment workspace for **Delta-OPD** — on-policy distillation for VLMs guided by per-token *image-vs-null* teacher delta.
 
 The verl training framework is vendored as a git submodule at `verl/` (forked from [`verl-project/verl`](https://github.com/verl-project/verl) at [`shihaohou/verl`](https://github.com/shihaohou/verl)). Experiments live under `experiments/`.
 
