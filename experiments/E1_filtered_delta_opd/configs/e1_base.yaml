@@ -146,6 +146,33 @@ trainer:
   balance_batch: true
 
 # ---------------------------------------------------------------------------
+# Ray runtime env — registers DeltaOPDAgentLoop + 4 losses + worker patch on
+# every Ray worker process.
+#
+# Without this, the registry populated by the driver process (entrypoint.py
+# calling enable()) is invisible to Ray actors (TaskRunner, WorkerDicts),
+# because Ray reimports modules on each worker — module-level state like
+# `DISTILLATION_LOSS_REGISTRY` starts empty. The first time a worker calls
+# `omega_conf_to_dataclass(distillation_config)`, `DistillationLossConfig.
+# __post_init__` looks up `loss_settings = get_distillation_loss_settings
+# (loss_mode)` → ValueError("Unsupported loss mode: e1_onpolicy_vanilla_kd").
+#
+# `worker_process_setup_hook` is Ray's per-worker init callback: Ray imports
+# the FQDN string at worker start, gets the callable, runs it exactly once.
+# Our `enable()` is idempotent — safe to run in the driver (already happens
+# in entrypoint.py) AND in every worker.
+# ---------------------------------------------------------------------------
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      worker_process_setup_hook: experiments.E1_filtered_delta_opd.src.on_policy.enable
+      env_vars:
+        # Pin so Ray workers can `import experiments.E1_filtered_delta_opd...`
+        # The driver is launched as `python -m ...` from the repo root (so its
+        # CWD == repo root); ${oc.env:PWD} resolves at driver-config-load time.
+        PYTHONPATH: ${oc.env:PWD}
+
+# ---------------------------------------------------------------------------
 # Delta-OPD knobs (read by DeltaOPDAgentLoop / losses.py).
 #
 # - beta: weight on CE-on-gold branch for filtered configs (C/D). 0.1 follows
