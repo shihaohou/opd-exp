@@ -8,6 +8,35 @@ teacher-error inheritance vs vanilla OPD.
 
 E1 is gated on E0's Conditional GO verdict (see `../E0_image_null_delta/results/e0_verdict.md`).
 
+## Method: **on-policy** distillation
+
+Delta-OPD = Delta **On-Policy Distillation**. The student rolls out its own
+responses; the teacher provides per-token logprobs (and top-K distributions
+under both image and null conditions) **on the student's rollout tokens**.
+This is the same data-distribution discipline as the
+[Thinking Machines On-Policy Distillation blog](https://thinkingmachines.ai/blog/on-policy-distillation/)
+and verl's
+[Async On-Policy KD recipe](https://verl.readthedocs.io/en/latest/advance/async-on-policy-distill.html).
+
+What this means concretely for E1:
+
+- **Trajectories at training time come from the student**, not from teacher
+  greedy. Teacher's pre-generated response is used only for the sample-level
+  `trajectory_pass` flag and for the CE-on-gold branch of filtered configs.
+- **`delta_t` is computed at training time on the student's rollout prefix**,
+  via a dual teacher forced-score (image-conditioned + null-conditioned).
+  Per-completion cost: 1 student rollout + 2 teacher forced-scores (≈ a few
+  GPU-seconds on Qwen2.5-VL-32B). NOT per-token.
+- **Loss form chosen**: top-K sparse KL `KL_topK(P_T^I(.|s_t) || P_S(.|s_t))`
+  on the teacher's top-K support at each student-visited prefix s_t. This
+  directly back-props (no PPO / importance-sampling) and reuses the top-K
+  data we already need for delta_t.
+
+A separate off-policy "weighted-SFT" baseline (`src/losses.py`) exists as a
+100-300 step **engineering smoke test** to validate the data / monitoring /
+eval pipeline before the on-policy v1 trainer is wired up. **Smoke results
+are NOT E1's scientific results** — see § "Off-policy smoke baseline" below.
+
 ## Hypothesis
 
 > Per-token image-vs-null KL on the teacher (`delta_t`) tracks image
@@ -17,18 +46,82 @@ E1 is gated on E0's Conditional GO verdict (see `../E0_image_null_delta/results/
 > student learn the *useful* part of the visual reasoning signal without
 > inheriting the prior-locked errors that E0 quantified.
 
-## Configs (4 ablations)
+## Configs (4 on-policy ablations)
 
-| Key | Recipe | Purpose |
+All four use student rollouts as the trajectory source. The loss is top-K
+sparse KL on teacher's top-K support at each student-visited position.
+`w_t` is the per-token weight (1 or normalized delta_t). `1[T_correct]`
+is the per-sample mask (1 if the precomputed teacher greedy got the gold,
+else 0). For configs C and D, samples with `1[T_correct] = 0` go through
+a CE-on-gold branch instead of the KL branch.
+
+| Key | Recipe | Role |
 |---|---|---|
-| A. `vanilla_opd` | Student rollout + teacher reverse-KL on full prefix, no filtering, no delta | Reproduces existing multimodal OPD recipe. Establishes the bias-propagation rate we're trying to beat. |
-| B. `raw_delta_opd` | `L = Σ_t delta_t · KL(p_T(.\|.) \|\| p_S(.\|.))`, no filtering | **Negative control.** Tests "image influence alone is insufficient." Expected to amplify wrong-direction influence on VLMBias recognition topics. |
-| C. `correct_filtered_opd` | `L = 1[T_correct] · Σ_t KL(p_T \|\| p_S)`, no delta weighting; CE on gold for teacher-wrong | **Critical control.** Isolates the contribution of teacher-correct filtering alone. Without this, any gain in D could be attributed to filtering rather than to delta weighting. |
-| D. `correct_filtered_delta_opd` | `L = 1[T_correct] · Σ_t delta_t · KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Primary candidate.** Filtering + delta. |
+| A. `VanillaKD` | All samples; `w_t = 1`; no filter. `L = Σ_t KL_topK(P_T^I(.|s_t) \|\| P_S(.|s_t))` | Existing-OPD baseline. Reproduces vanilla on-policy KD, what we want to beat. |
+| B. `RawDeltaKD` | All samples; `w_t = delta_t`; no filter. `L = Σ_t delta_t · KL_topK(P_T^I \|\| P_S)` | **Negative control.** Tests "image influence alone is insufficient." Expected to amplify wrong-direction influence on VLMBias recognition topics. |
+| C. `FilteredKD` | If `T_correct`: `L = Σ_t KL_topK(P_T^I \|\| P_S)`. Else: `L = β · CE(gold)`. No delta weighting. | **Critical control.** Isolates the contribution of teacher-correct filtering + CE-on-gold from delta weighting. Without C in the table, any gain in D could be attributed to filtering alone. |
+| D. `FilteredDeltaKD` | If `T_correct`: `L = Σ_t delta_t · KL_topK(P_T^I \|\| P_S)`. Else: `L = β · CE(gold)`. | **Primary candidate.** Filtering + delta. |
 
-Compute-budget fallback: if 4 runs are too much, run A + C + D only (drop Raw Delta-OPD). Note: dropping C is **not** acceptable — without the filtering-only control, D's gains are unattributable.
+The central comparisons are:
 
-**SFT (`L = -log p_S(y_T | x, I)` on teacher outputs)** is deferred to an optional E1.5 ablation. It answers a different question (does pure teacher imitation amplify pattern-matching errors?) and is not needed for the core method validation. Drop it from the v1 matrix unless compute is abundant.
+- **B vs A** — does raw delta hurt? (Expected: yes, on VLMBias recognition.)
+- **D vs C** — does delta help *given* filtering + CE? (The actual hypothesis.)
+- **C vs A** — does filtering + CE alone help? (Confound to isolate.)
+
+Compute-budget fallback: drop B if necessary. **Do not drop C** — without it
+any D > A gain is unattributable to delta.
+
+SFT (`L = -log p_S(y_T | x, I)` on teacher outputs) is deferred to optional
+E1.5. It's a different question (does teacher imitation amplify pattern-
+matching?) and not part of the core method validation.
+
+### delta_t normalization (required)
+
+E0 smoke test on ViRL39K confirmed `delta_t` is long-tailed:
+`mean ≈ 0.26, median ≈ 0.001` over response tokens. Raw delta as
+multiplicative weight would let ~1% of tokens dominate the gradient. v1
+applies a stable clip-then-rescale:
+
+```python
+w_t = clip(delta_t, p95(delta_t over valid tokens))
+w_t = w_t / mean(w_t over valid tokens)
+```
+
+So `mean(w_t) ≈ 1` per batch (vanilla setting becomes the natural reference).
+An alternative form `w_t = 1 + α · normalize(delta_t)` may be swept in v2.
+
+### Per-batch monitoring (mandatory, GPT-flagged)
+
+For configs C and D, log each step:
+- `e1/effective_kd_tokens` — # tokens contributing to KL branch (= `1[T_correct]` · response_len)
+- `e1/effective_ce_samples` — # samples in CE-on-gold branch
+- `e1/kd_loss` and `e1/ce_loss` separately
+- `e1/kd_ce_ratio` = `kd_loss / (kd_loss + ce_loss)`
+
+If `kd_ce_ratio` ≈ 0 (CE dominates) we cannot attribute D > C to delta —
+this would be a recovery diagnostic, not a method result.
+
+## Off-policy smoke baseline (NOT E1 results)
+
+`src/losses.py` currently implements an **off-policy weighted SFT** form:
+student is force-scored on the teacher's precomputed greedy response, with
+per-token NLL weighted by delta_t and/or masked by trajectory_pass. The
+registry names are `e1_offline_weighted_sft_{vanilla, raw_delta,
+correct_filtered, correct_filtered_delta}` to avoid confusion with the
+on-policy v1 losses (which will live in a separate file once written).
+
+This is **for engineering smoke testing only** — 100-300 steps on a 1K
+sample subset, to validate:
+- ViRL39K loader + mixture sampling + dedup
+- per-bucket monitoring hooks
+- delta_t clip / normalize doesn't explode
+- TEI eval pipeline reads checkpoints cleanly
+- CE-on-gold vs KL loss magnitudes stay sane
+
+It does NOT answer E1's central question (whether teacher-error inheritance
+happens on student-visited states; whether filtered Delta-OPD blocks it on
+student-visited states). Smoke results stay in `results/e1_smoke/`; the
+on-policy v1 results go in `results/e1_v1/`.
 
 ## Training data composition (starting point, not protocol)
 
@@ -171,34 +264,50 @@ Total: 8000 samples. Treat ratios as v1, sweep later.
 1. Whether to use `PassRate_32BTrained` as the trajectory_pass label directly, or generate our own 32B greedy and parse. Probably **both**: use PassRate as pre-filter (cheap), use our own gen as the canonical training-time label (correct). Open: do we need our own gen for bucket 2 / 3 since their answers are simple yes/no or integers — the 32B teacher pass rate there is plausibly close to 1.
 2. Synthesis pipeline complexity vs day budget. Building VLMBias-like generation is non-trivial — estimate 1 full day for a usable v1 with ~500 samples per failure mode.
 
-## Loss specs (all 4 configs)
+## Loss specs (all 4 on-policy configs)
 
-For a teacher-generated trajectory `y_T` on prompt `(x, I)`, let
-`trajectory_pass = 1` if `parse_correctness(y_T, gold) == True` (or `verifier_pass(y_T) == True`), else `0`.
+For each training sample, let:
+
+- `s_t = (x, I, y_<t)` where `y_<t` are tokens of the **student's current rollout**
+- `P_T^I(.|s_t)` = teacher's top-K distribution conditioned on the real image, at prefix `s_t`
+- `P_T^null(.|s_t)` = teacher's top-K distribution conditioned on null image, at prefix `s_t`
+- `P_S(.|s_t)` = student's distribution
+- `delta_t = KL_topK(P_T^I(.|s_t) || P_T^null(.|s_t))` — image influence at student's prefix
+- `w_t` = normalized weight (see § "delta_t normalization" above); = 1 for non-delta configs
+- `1[T_correct]` = sample-level mask from precomputed teacher greedy correctness
+- `β` = CE-on-gold weight (default 1.0)
 
 ```
-# Config A — Vanilla OPD
-L_vanilla = Σ_t KL_topK(p_T(.|x,I,y_<t) || p_S(.|x,I,y_<t))
+# Config A — VanillaKD
+L_A = Σ_t KL_topK(P_T^I(.|s_t) || P_S(.|s_t))
 
-# Config B — Raw Delta-OPD
-L_raw = Σ_t delta_t · KL_topK(p_T || p_S)
+# Config B — RawDeltaKD  (negative control)
+L_B = Σ_t w_t · KL_topK(P_T^I(.|s_t) || P_S(.|s_t))
+      where w_t = normalize(clip(delta_t, p95))
 
-# Config C — Correct-filtered OPD  (no delta)
-L_cf = trajectory_pass · Σ_t KL_topK(p_T || p_S)
-     + (1 - trajectory_pass) · λ_ans · CE(answer_tokens, gold)
+# Config C — FilteredKD + CE-on-gold  (filtering control)
+if 1[T_correct]:
+    L_C = Σ_t KL_topK(P_T^I(.|s_t) || P_S(.|s_t))
+else:
+    L_C = β · CE(student | gold_tokens)
+        (student is force-scored on gold; no rollout this sample)
 
-# Config D — Correct-filtered Delta-OPD  (primary candidate)
-L_cf_delta = trajectory_pass · Σ_t delta_t · KL_topK(p_T || p_S)
-           + (1 - trajectory_pass) · λ_ans · CE(answer_tokens, gold)
+# Config D — FilteredDeltaKD + CE-on-gold  (primary candidate)
+if 1[T_correct]:
+    L_D = Σ_t w_t · KL_topK(P_T^I(.|s_t) || P_S(.|s_t))
+else:
+    L_D = β · CE(student | gold_tokens)
 ```
 
-Open knobs (shared):
-- `λ_ans` (CE weight on gold answer when teacher wrong): start at 1.0 — same scale as KL
-- `delta_t` normalization: per-trajectory mean=1, or raw, or top-percentile clipping
+Open knobs:
+- `β` (CE weight on gold answer when teacher wrong): start at 1.0
 - `K` for top-K KL: 50 (consistent with E0)
-- Whether `trajectory_pass` is sample-level (current spec) or token-level (verifier on span granularity — future work)
+- `w_t` form: default `clip(delta_t, p95) / mean(clip)`; v2 may sweep `1 + α·normalize(delta_t)`
 
-The C-vs-D contrast is the experiment's central comparison: same filtering, same gold-CE on teacher-wrong, the **only** difference is whether KL is delta-weighted. That isolates the contribution of delta.
+Central comparisons:
+- **B vs A** — does raw delta hurt? (E0 predicts yes on VLMBias recognition)
+- **D vs C** — does delta help *given* the same filtering + CE branch? (The actual hypothesis test)
+- **C vs A** — how much of D > A is just filtering + CE? (Attribution control)
 
 ## Evaluation matrix
 
@@ -221,50 +330,61 @@ Secondary (analysis):
 
 ## Engineering punch list
 
-1. **Verl backbone — decided 2026-05-12.**
-   - Use `verl/trainer/distillation/` FSDP path (NOT `verl/recipe/gkd/`).
-     The recipe is Megatron-only, forward-KL-only, single-teacher-forward,
-     text-only. Bad fit.
-   - Use `verl/utils/dataset/rl_dataset.py` for multimodal data plumbing
-     (already supports `image_key`, `<image>` placeholder, HF ProcessorMixin).
-   - Register our 4 losses via `@register_distillation_loss(...)`.
-   - Reverse-KL: use the existing `compute_distillation_loss_reverse_kl_estimator`
-     (modes `k1` / `k2` / `k3`) as the per-token KL primitive.
-   - Per-token weight (delta_t): extend the existing `response_mask * loss`
-     multiplication to `response_mask * delta_t * trajectory_pass * loss`.
-2. **Multimodal data loaders** (one per bucket):
-   - ✅ `data/virl39k_loader.py` — DONE (2026-05-12). Includes PassRate filter,
-     `<image>` strip, `\boxed{}` extraction, single-image filter.
-   - ❌ `data/pope_style_builder.py` — TODO. Builds POPE-style Yes/No yes/no
-     from COCO train2017 + instance annotations, with image-level disjoint
-     against POPE-adv eval.
-   - ❌ `data/synthesize_counterfactuals.py` — TODO. Parametric/template
-     synthesis of VLMBias-like counterfactuals (animals leg count, flags
-     stripes, grids, game boards, chess pieces).
-   - ❌ `data/tallyqa_loader.py` — TODO. Filters TallyQA `complex` subset by
-     COCO image_id against POPE-adv.
-   - ❌ `data/mixture.py` — TODO. Samples across buckets per the locked recipe.
-3. **`data/dedup_check.py`** — TODO. Three-layer dedup (image_id intersection
-   + pHash near-duplicate + CLIP embedding NN). MUST PASS before training
-   launches.
-4. **`src/precompute_teacher.py`** — TODO. Reuses E0 `dual_forward.py` logic
-   on the locked 8K mixture; dumps per-sample `(response, correctness, delta_t[],
-   teacher_topk_logp[])` to disk. Output is what training loads.
-5. **`src/losses.py`** — TODO. Registers `vanilla_opd` / `raw_delta_opd` /
-   `correct_filtered_opd` / `correct_filtered_delta_opd` in verl's loss
-   registry. Each is a combination of: base reverse-KL × delta_t weight ×
-   trajectory_pass mask, plus optional CE-on-gold for teacher-wrong samples.
-6. **`src/trainer.py`** — TODO. Thin wrapper assembling verl FSDP trainer +
-   rl_dataset + our loss. Loads precomputed teacher cache.
-7. **`src/eval_tei.py`** — TODO. TEI / Escape rate / length-normalized
-   gain_margin on the frozen E0 teacher-wrong subset, plus per-topic VLMBias /
-   POPE-adv / MathVista evals.
-8. **Per-bucket training-time monitoring hooks** (in trainer):
-   teacher_correct_rate, n_effective_kl_tokens, n_effective_ce_samples,
-   kl_loss_contribution, ce_loss_contribution — all logged per step per bucket.
-9. **Length-normalized student-side option scoring** for the gain_margin eval
-   metric — port from E0 `metrics.py:make_option_len_fn`. Already merged in E0;
-   just needs wiring into `eval_tei.py`.
+1. **Verl backbone — decided 2026-05-12, refined after GPT review.**
+   - Use `verl/trainer/distillation/` FSDP path. NOT `verl/recipe/gkd/`
+     (Megatron-only; Qwen2.5-VL Megatron conversion is multi-day for the
+     ViT + projector + LLM composite).
+   - Borrow GKD recipe's three-stage shape: **rollout → teacher scoring → update**.
+   - Use `verl/utils/dataset/rl_dataset.py` for multimodal data plumbing.
+   - Distillation losses registered via `@register_distillation_loss(...)`.
+   - For on-policy v1: top-K sparse KL `KL_topK(P_T^I || P_S)` at student-
+     visited prefixes (back-props directly, no PPO/IS).
+2. **Data loaders** (one per bucket):
+   - ✅ `data/virl39k_loader.py` — DONE. PassRate filter, `<image>` strip,
+     `\boxed{}` extraction, single-image filter. 11,847 eligible rows.
+   - ❌ `data/pope_style_builder.py` — TODO. Builds POPE-style yes/no from
+     COCO train2017 + instance annotations; image-level disjoint with POPE-adv.
+   - ❌ `data/synthesize_counterfactuals.py` — TODO. Parametric synthesis
+     (animals leg count, flags stripes, grids, game boards, chess pieces).
+   - ❌ `data/tallyqa_loader.py` — TODO. TallyQA `complex` subset with
+     COCO image_id filter against POPE-adv.
+   - ❌ `data/mixture.py` — TODO. 8K E1-mini sampler per locked recipe.
+3. **`data/dedup_check.py`** — TODO. Three-layer dedup (image_id ∩ pHash ∩
+   CLIP NN). MUST PASS before training launches.
+4. **`src/precompute_teacher.py`** — ✅ DONE (off-policy form).
+   - Currently outputs per-token `teacher_logp_I/null` + `delta_t` on
+     teacher's response. These per-token fields are NOT used by on-policy v1.
+   - **Useful for on-policy v1**: only the sample-level fields
+     (`trajectory_pass`, `gold`, `ans_T_I`, `pass_rate_32b`, `category`).
+   - **Useful for v0 smoke**: all fields.
+   - When on-policy v1 is wired in, this script can be trimmed to skip the
+     dual forced-score (5× faster) — see `on_policy_v1_design.md`.
+5. **`src/losses.py`** — ✅ DONE (off-policy smoke baseline).
+   - Registers `e1_offline_weighted_sft_{vanilla,raw_delta,correct_filtered,
+     correct_filtered_delta}` for the 4 smoke configs.
+   - SMOKE TEST ONLY — see § "Off-policy smoke baseline" above.
+6. **`src/on_policy_trainer.py`** — TODO (the actual E1 v1 trainer).
+   - Student rollout (vLLM)
+   - Teacher dual forced-score (image + null) on student's rollout → top-K
+     log-probs + indices + `delta_t` per position
+   - Top-K sparse KL loss on teacher's top-K support
+   - Per-sample branch: `1[T_correct]` → KL; else CE-on-gold (no rollout, force-score gold)
+   - Per-bucket monitoring hooks (effective_kd_tokens, kd_ce_ratio, etc.)
+   - **Prerequisite spike**: read `verl/workers/rollout/` + `verl/experimental/
+     teacher_loop/` for the dual-forward teacher serving wiring.
+7. **`src/on_policy_losses.py`** — TODO. The 4 on-policy KD losses:
+   `e1_onpolicy_vanilla_kd`, `e1_onpolicy_raw_delta_kd`,
+   `e1_onpolicy_filtered_kd`, `e1_onpolicy_filtered_delta_kd`. Top-K KL
+   primitive; CE-on-gold branch dispatch via `data["loss_branch"]`.
+8. **`src/eval_tei.py`** — TODO. TEI / Escape / length-normalized gain_margin
+   on the frozen E0 teacher-wrong subset; per-topic VLMBias / POPE-adv /
+   MathVista evals.
+9. **Per-bucket training-time monitoring hooks** (in trainer):
+   teacher_correct_rate, effective_kd_tokens, effective_ce_samples,
+   kd_loss vs ce_loss, kd_ce_ratio, delta_t mean/var clipped — all logged
+   per step per bucket.
+10. **Length-normalized student-side option scoring** — port from E0
+    `metrics.py:make_option_len_fn` into `eval_tei.py`.
 
 ## Risks / open questions
 

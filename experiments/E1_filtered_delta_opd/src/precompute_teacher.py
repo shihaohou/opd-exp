@@ -1,7 +1,35 @@
 """
-Offline teacher pass for E1 training.
+Offline teacher pass for E1.
 
-For each sample in the training mixture:
+⚠️  Scope of usefulness:
+
+This script was written in an early phase of E1 design when the loss form
+was assumed to be off-policy weighted CE (student force-scores teacher's
+greedy response). After realizing OPD = On-Policy Distillation, the real
+E1 v1 training loop uses student rollouts and computes delta_t on the
+**student's** rollout prefix, not on teacher's response. So the per-token
+fields produced here (`teacher_logp_I`, `teacher_logp_null`, `delta_t`)
+are NOT used by the on-policy v1 trainer.
+
+What v1 DOES use from this output:
+  - sample_id, question, gold, ans_T_I, correct_I (= trajectory_pass)
+  - bucket / category / source / pass_rate_32b for monitoring
+  - response_token_ids of teacher's greedy — useful as a cold-start SFT
+    init or for a quick "weighted-SFT vs gold-CE" smoke baseline
+
+What v1 does NOT use:
+  - teacher_logp_I / teacher_logp_null / delta_t (these are on the wrong
+    trajectory — must be recomputed at training time on the student's
+    rollout prefix)
+
+The per-token forced-score pass takes ~70% of the wall time per sample;
+once v1 is wired in we can add a `--no-forced-score` mode that drops it
+and reduces precompute cost ≈ 5×. For now the full output stays because
+it is still consumed by:
+  - the off-policy "weighted_sft" smoke baseline (`src/losses.py`)
+  - E0-style sanity inspection of teacher's response
+
+Per-sample flow:
   1. Greedy-generate a teacher response under (question, image).
   2. Forced-score the response under (question, image)        → logp_I, topK_I
   3. Forced-score the response under (question, null_image)   → logp_null, topK_null
