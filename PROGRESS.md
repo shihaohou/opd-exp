@@ -8,7 +8,7 @@
 ## TL;DR
 
 - **Project**: Delta-OPD — **on-policy** distillation for VLMs reweighted by per-token image-vs-null teacher KL.
-- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1.5 / Stage 2 v1 complete** — on-policy trainer code lands and **Config A smoke passes end-to-end**: 12 train steps + validation + checkpoint write on 50 ViRL39K samples. Next is Day 2 (buckets 2 + 3 data builders + dedup + 8K mixture).
+- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1.5 / Stage 2 v1 complete** — on-policy trainer code lands and **all 4 configs (A/B/C/D) pass smoke**: 12 train steps + validation + checkpoint on 50 ViRL39K samples each. Health-check metrics in band: B/D `delta_t_mean_post_norm ≈ 1.0`; C/D `kl_ce_ratio = 0.5` (well within the GPT-flagged [0.3, 0.7] attribution-guard band). Next is Day 2 (buckets 2 + 3 data builders + dedup + 8K mixture).
 - **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; failures (delta-correctness correlation, gain_margin on VLMBias) are *informative* and constrain E1 method choice.
 - **E0.3-B finding (today)**: Length-normalized `gain_margin` confirms VLMBias per-topic direction is **stable** (no sign flips). Motivation is not a length-bias artifact.
 - **E1 design (locked today)**: On-policy v1. 4 configs A/B/C/D = `VanillaKD` / `RawDeltaKD` / `FilteredKD` / `FilteredDeltaKD`. **C is the critical control** — without it any D > A gain is unattributable to delta. Loss = top-K sparse forward KL on student-rollout prefixes, optionally × normalized `delta_t` × `1[T_correct]` mask, with CE-on-gold branch for teacher-wrong samples.
@@ -196,9 +196,14 @@ exercised on the GPU so far.
 | `verl/workers/config/distillation.py` (submodule edit at `2c118243`) | `DistillationLossConfig.__post_init__` now lazy-registers `e1_onpolicy_*` losses. Submodule pointer bumped in `022c465f`. | ✅ |
 | `docs/e1_smoke_runbook.md` | R1-R5: each of the 5 non-obvious integration traps + verification + fix + long-term cleanup. | ✅ |
 
-### Smoke run results (Config A only)
+### Smoke run results (all 4 configs verified)
 
-Run command: `bash scripts/run_e1_recipe_smoke.sh A` with `TRAIN_BATCH_SIZE=4`, `MAX_PROMPT_LENGTH=4096`, etc. (the launcher's defaults after this round).
+Run command per config: `bash scripts/run_e1_recipe_smoke.sh {A,B,C,D}` with
+`TRAIN_BATCH_SIZE=4`, `MAX_PROMPT_LENGTH=4096`, etc. (launcher defaults).
+50 ViRL39K samples → 12 train steps per epoch, 1 epoch, then validation
+and checkpoint. Each run takes ~3 min wall time.
+
+Per-stage pipeline (same for A/B/C/D):
 
 | Stage | Status |
 |---|---|
@@ -213,8 +218,29 @@ Run command: `bash scripts/run_e1_recipe_smoke.sh A` with `TRAIN_BATCH_SIZE=4`, 
 | Checkpoint write | ✅ |
 | Graceful exit | ⚠️ vLLM/Ray teardown emits noisy errors but exit-0; not blocking |
 
-**B/C/D not yet exercised on GPU.** Code paths are unit-tested locally but the
-dual-forward + delta_t + CE branch are unverified end-to-end.
+Per-config monitoring metrics (step 12):
+
+| Config | `kl_ce_ratio` | `effective_ce_samples` (per micro) | `delta_t_mean_post_norm` | `delta_t_mean_pre_norm` | Verdict |
+|---|---|---|---|---|---|
+| A vanilla_kd | — | — | — | — | ✅ all KL, no delta, no filter |
+| B raw_delta_kd | — | 0 (no filter) | **0.99999998** | 0.203 (matches E0 ViRL39K) | ✅ delta normalization mathematically tight |
+| C filtered_kd | **0.50** | 0.5 (batch=4, ~50% T_wrong) | — (no delta) | — | ✅ KL/CE balance dead-center of healthy band |
+| D filtered_delta_kd | **0.50** | 0.5 | **0.99999997** | 0.057 | ✅ both delta + CE active |
+
+Attribution guard from GPT review (`kl_ce_ratio` in `[0.3, 0.7]`) holds for
+C and D → β=0.1 is fine, no tuning needed before Day 2.
+
+Interesting (not a blocker): D's `delta_t_mean_pre_norm` is ~3.5× lower than
+B's. D only computes delta over teacher-correct samples; that subset shows
+weaker image dependence than the full ViRL39K population. Worth a closer
+look in the eval pass (D-vs-C gain might be small if `delta_t` itself is
+small on the filtered subset), but doesn't block running the full 8K sweep.
+
+How to re-extract these metrics from a future smoke run:
+```bash
+bash scripts/run_e1_recipe_smoke.sh C ... 2>&1 | tee /tmp/c.log
+bash experiments/E1_filtered_delta_opd/scripts/show_e1_metrics.sh /tmp/c.log
+```
 
 ### Stage 2 design deviations from `on_policy_v1_design.md`
 
