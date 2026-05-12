@@ -460,5 +460,9 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | **E1 multi-bucket parquet builder (jsonl → train.parquet)** | `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` |
 | **E1 recipe configs (A/B/C/D)** | `experiments/E1_filtered_delta_opd/configs/recipe_*.yaml` |
 | **E1 smoke launcher** | `experiments/E1_filtered_delta_opd/scripts/run_e1_recipe_smoke.sh` |
+| **E1 eval (Day 3 Step 1): TEI / Escape / VLMBias / POPE / MathVista** | `experiments/E1_filtered_delta_opd/src/eval_tei.py` |
+| **E1 train-log extractor (Day 3 logging tool): log → CSV + MD + JSON** | `experiments/E1_filtered_delta_opd/scripts/extract_train_metrics.py` |
+| **E1 synth-bucket gate (Day 3 Step 2): per-topic teacher diagnostic + PASS/FAIL** | `experiments/E1_filtered_delta_opd/scripts/synth_sanity.py` |
+| Legacy: e1_v1 monitoring grep | `experiments/E1_filtered_delta_opd/scripts/show_e1_metrics.sh` (superseded by extract_train_metrics.py) |
 | E1 off-policy smoke-baseline losses (NOT scientific results) | `experiments/E1_filtered_delta_opd/src/losses.py` |
 | vLLM dual-forward verification script | `experiments/E1_filtered_delta_opd/src/spike_vllm_dual_forward.py` |

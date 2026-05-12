@@ -60,25 +60,129 @@ Metric layer testable on Mac with fixture jsonls (no GPU). Model loading + datas
 
 **Step 2 — Bucket-3 teacher sanity (8 GPUs on server, ~1h)**
 
-Run `precompute_teacher.py --bucket synthetic` on all 1500 synth images. Aggregate per topic (patterned_grid / flag / game_board / chess_position / animal):
-- teacher accuracy
-- gain_margin (length-norm)
-- canonical-prior "expected_bias" rate (for `animal`: how often does the teacher answer the canonical 4 even when the image shows 5 legs?)
-- student/teacher same-wrong overlap
+Two commands:
 
-**Decision gate**: if teacher accuracy on `animal` is high (≥80%) and gain_margin doesn't go negative, the synth animals are too toy — canonical prior is NOT being triggered, bucket 3 won't train the recognition failure mode. **Fix data before training** (consider CLIP-guided / diffusion-based animal generation in a v2 synth pipeline). The other 4 topics (grid / flag / board / chess) are likely fine; animal is the suspect.
+```bash
+# 2a. Run 32B teacher on all 1500 synth images (~1h on 8 H800 shard-parallel,
+#     or ~5-7h single GPU). The mixture bucket name is "synthetic"; the
+#     per-record `extras.topic` carries the sub-topic.
+for SHARD in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$SHARD \
+  python -m experiments.E1_filtered_delta_opd.src.precompute_teacher \
+    --bucket synthetic \
+    --loader-kwargs '{"out_dir":"'$DATASETS'/e1_synth_v1"}' \
+    --model-path $MODELS/Qwen2.5-VL-32B-Instruct \
+    --output $RESULTS/e1_synth_teacher_shard_${SHARD}.jsonl \
+    --shard-index $SHARD --num-shards 8 &
+done; wait
+cat $RESULTS/e1_synth_teacher_shard_*.jsonl > $RESULTS/e1_synth_teacher.jsonl
+
+# 2b. Apply the gate + emit MD / JSON / CSV reports.
+python -m experiments.E1_filtered_delta_opd.scripts.synth_sanity \
+    $RESULTS/e1_synth_teacher.jsonl \
+    --out $RESULTS/e1_synth_sanity
+```
+
+`synth_sanity.py` exits 0 (PASS) or 1 (FAIL) and writes:
+
+- `<out>.md`  — verdict + per-topic table, copy-paste into GPT
+- `<out>.json` — programmatic aggregate
+- `<out>.csv` — per-topic rows for plotting
+
+**Decision gate** (encoded in the script):
+
+| condition | verdict |
+|---|---|
+| `animal` `accuracy_on_counterfactual >= 0.80` | **FAIL** — teacher is correctly counting; silhouette doesn't trigger the canonical prior |
+| `accuracy_on_counterfactual < 0.80` AND `prior_trigger_rate < 0.30` | **FAIL** — teacher errors not from the prior |
+| `accuracy_on_counterfactual < 0.80` AND `prior_trigger_rate >= 0.30` | **PASS** — bucket-3 is ready for training |
+
+If FAIL: do NOT proceed to Step 3. Either fix the synth pipeline (CLIP-guided / diffusion-based animal generation in a v2) or drop bucket 3 from the mixture for v1 and accept that Animals failure mode won't be covered. The other 4 topics (grid / flag / board / chess) report accuracy only; they're not the suspect.
 
 **Step 3 — 1K mini-sweep (8 GPUs, ~1.5h total for A/B/C/D)**
 
-Subsample the 8K mixture to 1K (500 / 200 / 112 / 188 per bucket, scaled by 1/8) and run A/B/C/D × ~50 steps each. Immediately call `eval_tei.py` on each checkpoint. Look at **direction**, not magnitude:
+Subsample the 8K mixture to 1K (same per-bucket ratio), run A/B/C/D × ~50 steps each, extract metrics, merge checkpoint, run eval_tei. Look at **direction**, not magnitude.
+
+```bash
+# 3a. Build a 1K mini parquet (sample 1/8 from the 8K). The simplest path
+#     is to re-run `mixture.py` with the per-bucket counts scaled down:
+python -m experiments.E1_filtered_delta_opd.data.mixture \
+    --output $DATASETS/e1_mini_v1/mixture_1k.jsonl \
+    --virl39k-root $DATASETS/ViRL39K --coco-train-root $DATASETS/coco \
+    --pope-adv-root $DATASETS/POPE-adversarial \
+    --tallyqa-json $DATASETS/tallyqa/train.json \
+    --tallyqa-images-root $DATASETS/tallyqa_images \
+    --synth-dir $DATASETS/e1_synth_v1 \
+    --n-virl39k 500 --n-pope-style 200 --n-tallyqa 112 --n-synthetic 188
+
+# 3b. Precompute teacher on the 1K (~10 min, 8 shards)
+for SHARD in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$SHARD \
+  python -m experiments.E1_filtered_delta_opd.src.precompute_teacher \
+    --bucket mixture \
+    --loader-kwargs '{"manifest_path":"'$DATASETS'/e1_mini_v1/mixture_1k.jsonl"}' \
+    --model-path $MODELS/Qwen2.5-VL-32B-Instruct \
+    --output $RESULTS/e1_1k_precompute_shard_${SHARD}.jsonl \
+    --shard-index $SHARD --num-shards 8 &
+done; wait
+
+# 3c. Build train parquet (cap a small val set off the same precompute)
+python -m experiments.E1_filtered_delta_opd.data.make_train_parquet \
+    --jsonl $RESULTS/e1_1k_precompute_shard_*.jsonl \
+    --student-tokenizer $MODELS/Qwen2.5-VL-7B-Instruct \
+    --output $RESULTS/e1_mini_1k_train.parquet
+
+# 3d. For each config: train, extract metrics, merge checkpoint, eval.
+for L in A B C D; do
+  E1_TRAIN_PARQUET=$RESULTS/e1_mini_1k_train.parquet \
+  E1_VAL_PARQUET=$RESULTS/e1_mini_1k_train.parquet \
+  bash scripts/run_e1_recipe_smoke.sh $L 2>&1 | tee $RESULTS/log_1k_$L.log
+
+  # Extract structured train metrics → CSV + MD + JSON; exits 1 on health-check fail
+  python -m experiments.E1_filtered_delta_opd.scripts.extract_train_metrics \
+      $RESULTS/log_1k_$L.log \
+      --out $RESULTS/train_1k_$L --config $L
+
+  # Merge FSDP shards → HF format. CKPT_DIR is whatever
+  # `trainer.default_local_dir/global_step_N/actor` the smoke run wrote.
+  CKPT_DIR=$RESULTS/e1_1k_$L_ckpt   # adjust to your verl output path
+  python -m verl.model_merger merge \
+      --backend fsdp \
+      --local_dir $CKPT_DIR \
+      --target_dir $RESULTS/e1_1k_${L}_hf
+
+  # Run student inference on the 3 eval datasets (~15-30 min each on 1 GPU)
+  for DS in vlmbias pope mathvista; do
+    python -m experiments.E1_filtered_delta_opd.src.eval_tei infer \
+        --checkpoint $RESULTS/e1_1k_${L}_hf \
+        --dataset $DS \
+        --dataset-root $DATASETS/$(case $DS in vlmbias) echo VLMBias;; \
+                                                pope) echo POPE-adversarial;; \
+                                                mathvista) echo MathVista-mini;; esac) \
+        --output $RESULTS/eval_1k_${L}_${DS}.jsonl
+  done
+
+  # Compute metrics summary
+  python -m experiments.E1_filtered_delta_opd.src.eval_tei metrics \
+      --student-vlmbias-jsonl $RESULTS/eval_1k_${L}_vlmbias.jsonl \
+      --teacher-vlmbias-jsonl experiments/E0_image_null_delta/results/e0_teacher32b_vlmbias_main.shard*.jsonl \
+      --student-pope-jsonl $RESULTS/eval_1k_${L}_pope.jsonl \
+      --student-mathvista-jsonl $RESULTS/eval_1k_${L}_mathvista.jsonl \
+      --student-base-vlmbias-jsonl experiments/E0_image_null_delta/results/e0_student7b_vlmbias_main.shard*.jsonl \
+      --tokenizer-path $MODELS/Qwen2.5-VL-7B-Instruct \
+      --output $RESULTS/eval_1k_${L}.json
+done
+```
+
+After all 4 configs finish, compare them by directly diffing the 4 `eval_1k_{A,B,C,D}.json` files (or jq into a table). Look at:
 
 | Signal | Interpretation |
 |---|---|
-| B Recognition Aggregate < A | Raw delta amplifies wrong-direction influence (Hypothesis 2 supported on mini-scale) |
-| C TEI rate < A's | Filtering + CE reduces inheritance (Hypothesis 1 supported) |
-| D gain_margin > C's (less negative) | Delta adds value beyond filtering (Hypothesis 3 supported) |
-| All four collapse on MathVista | Filtering too aggressive — reduce β |
-| All four ≈ A | 1K too small, no method signal, or eval metrics not sensitive |
+| `eval_1k_B.json.vlmbias.recognition_aggregate.accuracy` < A's | Raw delta amplifies wrong-direction influence (H2 ✓) |
+| `eval_1k_C.json.tei.tei_rate` < A's (and < E0 baseline 0.620) | Filtering + CE reduces inheritance (H1 ✓) |
+| `eval_1k_D.json.tei.tei_rate` lower than C's, OR `vlmbias.recognition_aggregate.accuracy` higher | Delta adds value beyond filtering (H3 ✓) |
+| All four `mathvista.accuracy` collapse | Filtering too aggressive — reduce β |
+| All four ≈ E0 baseline (acc=0.226, TEI=0.620) | 1K too small / method has no signal / eval not sensitive |
 
 If 1K shows zero direction, 8K probably won't either — diagnose before scaling up.
 
