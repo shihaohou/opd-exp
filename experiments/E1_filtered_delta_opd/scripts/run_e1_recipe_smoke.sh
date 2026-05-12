@@ -42,6 +42,10 @@ NNODES=${NNODES:-1}
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-4}
 TEACHER_TP=${TEACHER_TP:-4}      # single teacher replica, tp=4 inside the teacher pool
 ROLLOUT_TP=${ROLLOUT_TP:-2}      # 2 vLLM rollout replicas inside the actor pool (4 / 2 = 2)
+# verl's AgentLoopManager asserts `train_batch_size % num_workers == 0`. The
+# verl default (8) is too high for the smoke setup (batch=4), so align it to
+# the actor-pool size by default; bump alongside batch_size in production runs.
+AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-$NGPUS_PER_NODE}
 
 # ---- Batch / length ----
 # Qwen2.5-VL image processor expands each image into ~1000-1500 image_pad
@@ -73,6 +77,7 @@ python -m experiments.E1_filtered_delta_opd.src.on_policy.entrypoint \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
     actor_rollout_ref.rollout.max_model_len=$MAX_NUM_TOKENS \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
+    actor_rollout_ref.rollout.agent.num_workers=$AGENT_LOOP_WORKERS \
     distillation.teacher_models.teacher_model.model_path="$E1_TEACHER_MODEL" \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=$TEACHER_TP \
     distillation.teacher_models.teacher_model.inference.max_model_len=$MAX_NUM_TOKENS \
