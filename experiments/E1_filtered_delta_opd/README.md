@@ -21,12 +21,14 @@ E1 is gated on E0's Conditional GO verdict (see `../E0_image_null_delta/results/
 
 | Key | Recipe | Purpose |
 |---|---|---|
-| A. `sft` | `L = -log p_S(y_T \| x, I)` on teacher's image-conditioned greedy outputs | Off-policy imitation baseline. Tests whether teacher imitation alone causes / amplifies pattern-matching errors. |
-| B. `vanilla_opd` | Student rollout + teacher reverse-KL on full prefix | Reproduces existing multimodal OPD recipe. Establishes the bias-propagation rate we're trying to beat. |
-| C. `raw_delta_opd` | `L = Σ_t delta_t · KL(p_T(.\|.) \|\| p_S(.\|.))` | **Negative control.** Tests "image influence alone is insufficient." Expected to amplify wrong-direction influence on VLMBias recognition topics. |
-| D. `filtered_delta_opd` | Same as C, but `delta_t` is zeroed on trajectories where teacher is wrong; plus CE on ground-truth answer tokens | **Primary candidate.** |
+| A. `vanilla_opd` | Student rollout + teacher reverse-KL on full prefix, no filtering, no delta | Reproduces existing multimodal OPD recipe. Establishes the bias-propagation rate we're trying to beat. |
+| B. `raw_delta_opd` | `L = Σ_t delta_t · KL(p_T(.\|.) \|\| p_S(.\|.))`, no filtering | **Negative control.** Tests "image influence alone is insufficient." Expected to amplify wrong-direction influence on VLMBias recognition topics. |
+| C. `correct_filtered_opd` | `L = 1[T_correct] · Σ_t KL(p_T \|\| p_S)`, no delta weighting; CE on gold for teacher-wrong | **Critical control.** Isolates the contribution of teacher-correct filtering alone. Without this, any gain in D could be attributed to filtering rather than to delta weighting. |
+| D. `correct_filtered_delta_opd` | `L = 1[T_correct] · Σ_t delta_t · KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Primary candidate.** Filtering + delta. |
 
-Compute-budget fallback: if 4 runs are too much, run B + C + D only (drop SFT).
+Compute-budget fallback: if 4 runs are too much, run A + C + D only (drop Raw Delta-OPD). Note: dropping C is **not** acceptable — without the filtering-only control, D's gains are unattributable.
+
+**SFT (`L = -log p_S(y_T | x, I)` on teacher outputs)** is deferred to an optional E1.5 ablation. It answers a different question (does pure teacher imitation amplify pattern-matching errors?) and is not needed for the core method validation. Drop it from the v1 matrix unless compute is abundant.
 
 ## Training data composition (starting point, not protocol)
 
@@ -38,24 +40,34 @@ Compute-budget fallback: if 4 runs are too much, run B + C + D only (drop SFT).
 
 Total target: ~8K-20K samples for E1-mini. Full scale comes later.
 
-## Filtered Delta-OPD loss spec
+## Loss specs (all 4 configs)
 
-For a teacher-generated trajectory `y_T` on prompt `(x, I)`:
+For a teacher-generated trajectory `y_T` on prompt `(x, I)`, let
+`trajectory_pass = 1` if `parse_correctness(y_T, gold) == True` (or `verifier_pass(y_T) == True`), else `0`.
 
 ```
-trajectory_pass = (parse_correctness(y_T, gold) == True)     # or verifier_pass(y_T)
-verified_mask_t = trajectory_pass                              # currently sample-level all-or-nothing
+# Config A — Vanilla OPD
+L_vanilla = Σ_t KL_topK(p_T(.|x,I,y_<t) || p_S(.|x,I,y_<t))
 
-L_filtered_delta = Σ_t verified_mask_t · delta_t · KL_topK(
-                       p_T(. | x, I, y_<t) || p_S(. | x, I, y_<t))
-              + λ_ans · CE(answer_tokens, gold)               # for samples where teacher is wrong
+# Config B — Raw Delta-OPD
+L_raw = Σ_t delta_t · KL_topK(p_T || p_S)
+
+# Config C — Correct-filtered OPD  (no delta)
+L_cf = trajectory_pass · Σ_t KL_topK(p_T || p_S)
+     + (1 - trajectory_pass) · λ_ans · CE(answer_tokens, gold)
+
+# Config D — Correct-filtered Delta-OPD  (primary candidate)
+L_cf_delta = trajectory_pass · Σ_t delta_t · KL_topK(p_T || p_S)
+           + (1 - trajectory_pass) · λ_ans · CE(answer_tokens, gold)
 ```
 
-Open knobs:
-- `λ_ans` (CE weight on gold answer when teacher wrong): start at 1.0
+Open knobs (shared):
+- `λ_ans` (CE weight on gold answer when teacher wrong): start at 1.0 — same scale as KL
 - `delta_t` normalization: per-trajectory mean=1, or raw, or top-percentile clipping
 - `K` for top-K KL: 50 (consistent with E0)
-- Whether `verified_mask_t` is sample-level (current spec) or token-level (verifier on span granularity — future work)
+- Whether `trajectory_pass` is sample-level (current spec) or token-level (verifier on span granularity — future work)
+
+The C-vs-D contrast is the experiment's central comparison: same filtering, same gold-CE on teacher-wrong, the **only** difference is whether KL is delta-weighted. That isolates the contribution of delta.
 
 ## Evaluation matrix
 
@@ -97,24 +109,30 @@ Secondary (analysis):
 
 ## Risks / open questions
 
-- Will student converge fast enough on Filtered Delta-OPD when most of the
-  Animals topic has no teacher-correct trajectories to weight? (E0 finding.)
-  Probable mitigation: gold-CE on answer tokens for the non-filtered samples.
+- Will the student converge fast enough on Correct-filtered Delta-OPD when
+  most of the Animals topic has no teacher-correct trajectories to weight?
+  (E0 finding: teacher acc on Animals = 0/546.)
+  Probable mitigation: gold-CE on answer tokens for the non-filtered samples
+  (the `λ_ans · CE` term is exactly for this).
 - Are 32B-teacher generations on ViRL39K actually correct often enough to
-  give Filtered Delta-OPD useful training signal? Need to verify before
-  committing to ViRL39K as the main bucket. Sample ~500 first.
+  give Correct-filtered Delta-OPD useful training signal? Need to verify
+  before committing to ViRL39K as the main bucket. Sample ~500 first.
 - Memory: training 7B + holding 32B teacher in memory for online delta
   computation may not fit on a single H800. Options:
   - Precompute teacher logits / delta offline (cheap if we cache top-K only)
   - Run teacher on separate GPUs via vLLM serve, fetch logits over IPC
+- The C-vs-D contrast may be small if delta_t is nearly uniform on filtered
+  (teacher-correct) trajectories. Track `delta_t` variance on the filtered
+  subset during training — if it collapses, the delta signal is doing little
+  work and Raw Delta-OPD's "image-influence-alone" story loses force.
 
 ## Day-by-day plan (tomorrow start)
 
 | Day | Goal |
 |---|---|
 | **Day 1** | Download ViRL39K + LLaVA-CoT; spike verl GKD recipe; pick entry point; write multimodal loader; implement teacher pre-generation. |
-| **Day 2** | Implement SFT trainer + Vanilla OPD; smoke-test both on 1K subset, 100 steps; verify checkpointing. |
-| **Day 3** | Implement Raw Delta-OPD + Filtered Delta-OPD losses. Eval hooks. |
+| **Day 2** | Implement Vanilla OPD trainer; smoke-test on 1K subset, 100 steps; verify checkpointing + eval hooks. |
+| **Day 3** | Implement Raw Delta-OPD + Correct-filtered OPD + Correct-filtered Delta-OPD losses (the latter three share filtering/CE plumbing, build them together). |
 | **Day 4** | Launch 4-config full run on 8K-sample E1-mini. |
 | **Day 5** | First eval, decide v2 hyperparameters. |
 
@@ -125,10 +143,10 @@ experiments/E1_filtered_delta_opd/
 ├── README.md                   # this file
 ├── configs/
 │   ├── e1_default.yaml         # base config (mirrors E0 spirit)
-│   ├── recipe_sft.yaml
 │   ├── recipe_vanilla_opd.yaml
 │   ├── recipe_raw_delta_opd.yaml
-│   └── recipe_filtered_delta_opd.yaml
+│   ├── recipe_correct_filtered_opd.yaml
+│   └── recipe_correct_filtered_delta_opd.yaml
 ├── data/
 │   ├── virl39k_loader.py
 │   ├── llava_cot_loader.py

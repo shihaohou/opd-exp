@@ -14,8 +14,11 @@ Five metrics:
   5a  student-teacher wrong-overlap                          [VLMBias, needs student jsonl]
   5b  mean_delta(hallucinated) vs mean_delta(grounded)       [POPE-adv, model answers yes]
 
-This module is intentionally independent of torch / transformers so it can run
-on the Mac for inspection without touching the venv on the server.
+This module is intentionally independent of torch so it can run on the Mac for
+inspection. `transformers` is only imported lazily when `--tokenizer-path` is
+passed, in order to compute the length-normalized variant of metric 3
+(`gain_margin_lengthnorm`). Without a tokenizer the raw `gain_margin` is still
+reported as before.
 """
 
 from __future__ import annotations
@@ -25,8 +28,9 @@ import csv
 import json
 import statistics
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -150,25 +154,69 @@ def metric_2_mean_delta_by_correctness(records: list[dict]) -> dict[str, Any]:
     }
 
 
-def metric_3_visual_gain(records: list[dict]) -> dict[str, Any]:
+def metric_3_visual_gain(
+    records: list[dict],
+    option_len_fn: Optional[Callable[[str], int]] = None,
+) -> dict[str, Any]:
     """
     For records that carry option_logP (VLMBias):
-        gain(label) = option_logP['I'][label] - option_logP['null'][label]
+        gain(label)      = option_logP['I'][label] - option_logP['null'][label]
+        gain_pertok(label) = gain(label) / n_tokens(option_text_for_label)
+
     Compare mean gain on ground_truth vs expected_bias.
+
+    The length-normalized variant is computed only when `option_len_fn` is
+    provided. It addresses the caveat noted in `e0_verdict.md`: when
+    `ground_truth` and `expected_bias` tokenize to different lengths the raw
+    sum-logP comparison has a length bias.
+
+    Length is counted in-context via the boundary trick implemented in
+    `make_option_len_fn`: `len(tok("\\n" + s)) - len(tok("\\n"))`. This matches
+    the way `score_option` in dual_forward.py concatenates the option string
+    after the assistant cue (which ends with a newline).
     """
     gains_gt: list[float] = []
     gains_bias: list[float] = []
+    gains_gt_per_tok: list[float] = []
+    gains_bias_per_tok: list[float] = []
+    n_skipped_lengthnorm = 0
     for r in records:
         opt = r.get("option_logP")
         if not opt:
             continue
         I = opt.get("I", {})
         N = opt.get("null", {})
+        extras = r.get("extras") or {}
+
         if "ground_truth" in I and "ground_truth" in N:
-            gains_gt.append(I["ground_truth"] - N["ground_truth"])
+            g = I["ground_truth"] - N["ground_truth"]
+            gains_gt.append(g)
+            if option_len_fn is not None:
+                gt_text = r.get("gold") or extras.get("ground_truth")
+                if gt_text:
+                    L = option_len_fn(gt_text)
+                    if L > 0:
+                        gains_gt_per_tok.append(g / L)
+                    else:
+                        n_skipped_lengthnorm += 1
+                else:
+                    n_skipped_lengthnorm += 1
+
         if "expected_bias" in I and "expected_bias" in N:
-            gains_bias.append(I["expected_bias"] - N["expected_bias"])
-    return {
+            g = I["expected_bias"] - N["expected_bias"]
+            gains_bias.append(g)
+            if option_len_fn is not None:
+                bias_text = extras.get("expected_bias")
+                if bias_text:
+                    L = option_len_fn(bias_text)
+                    if L > 0:
+                        gains_bias_per_tok.append(g / L)
+                    else:
+                        n_skipped_lengthnorm += 1
+                else:
+                    n_skipped_lengthnorm += 1
+
+    out: dict[str, Any] = {
         "n_gt": len(gains_gt),
         "n_bias": len(gains_bias),
         "mean_gain_ground_truth": safe_mean(gains_gt),
@@ -178,6 +226,55 @@ def metric_3_visual_gain(records: list[dict]) -> dict[str, Any]:
             if gains_gt and gains_bias else None
         ),
     }
+    if option_len_fn is not None:
+        out.update({
+            "mean_gain_per_tok_ground_truth": safe_mean(gains_gt_per_tok),
+            "mean_gain_per_tok_expected_bias": safe_mean(gains_bias_per_tok),
+            "gain_margin_lengthnorm": (
+                safe_mean(gains_gt_per_tok) - safe_mean(gains_bias_per_tok)
+                if gains_gt_per_tok and gains_bias_per_tok else None
+            ),
+            "n_skipped_lengthnorm": n_skipped_lengthnorm,
+        })
+    return out
+
+
+def make_option_len_fn(tokenizer_path: str) -> Optional[Callable[[str], int]]:
+    """
+    Return a memoized callable `option_text -> n_tokens` that matches how
+    `score_option` in dual_forward.py counts response tokens.
+
+    Boundary trick: `score_option` does `full_text = prompt_text + option_text`
+    where `prompt_text` ends with the assistant cue `<|im_start|>assistant\\n`.
+    The number of tokens contributed by `option_text` is therefore the diff
+    between `tokenize("\\n" + option)` and `tokenize("\\n")`, which captures
+    BPE merge behavior at the boundary (e.g. leading-space tokens). Standalone
+    `tokenize(option)` would miss this for some BPE tokenizers, but the diff
+    cancels the boundary.
+
+    Returns None if `transformers` is unavailable or the tokenizer fails to
+    load — the caller should then skip the length-normalized branch.
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        print(f"[metrics] transformers not installed; skipping length-norm metric 3")
+        return None
+    try:
+        tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print(f"[metrics] failed to load tokenizer {tokenizer_path}: {e}; "
+              "skipping length-norm metric 3")
+        return None
+
+    newline_len = len(tok.encode("\n", add_special_tokens=False))
+
+    @lru_cache(maxsize=4096)
+    def n_tokens(option_text: str) -> int:
+        return len(tok.encode("\n" + option_text, add_special_tokens=False)) - newline_len
+
+    print(f"[metrics] loaded tokenizer {tokenizer_path} for length-norm metric 3")
+    return n_tokens
 
 
 def metric_4_top_delta_tokens(
@@ -424,12 +521,29 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
         f"Spearman={_fmt(m2['spearman_delta_correctness'], '+.3f')}"
     )
 
-    c3_pass = m3["gain_margin"] is not None and m3["gain_margin"] > 0
+    # Criterion (3) preferentially evaluates on the length-normalized variant
+    # if it was computed; otherwise falls back to the raw sum-logP variant.
+    # Both numbers are shown in the detail string so the reader can see the
+    # length-bias magnitude.
+    m3_ln = m3.get("gain_margin_lengthnorm")
+    if m3_ln is not None:
+        c3_pass = m3_ln > 0
+        c3_detail = (
+            f"gain_margin_lengthnorm={_fmt(m3_ln, '+.4f')} "
+            f"(per-tok gain_gt={_fmt(m3['mean_gain_per_tok_ground_truth'], '+.4f')}, "
+            f"gain_bias={_fmt(m3['mean_gain_per_tok_expected_bias'], '+.4f')}); "
+            f"raw sum-logP gain_margin={_fmt(m3['gain_margin'], '+.4f')}"
+        )
+    else:
+        c3_pass = m3["gain_margin"] is not None and m3["gain_margin"] > 0
+        c3_detail = (
+            f"gain_margin={_fmt(m3['gain_margin'], '+.4f')} "
+            f"(gain_gt={_fmt(m3['mean_gain_ground_truth'], '+.4f')}, "
+            f"gain_bias={_fmt(m3['mean_gain_expected_bias'], '+.4f')})"
+        )
     status["(3) VLMBias: gain(ground_truth) > gain(expected_bias)"] = (
         c3_pass,
-        f"gain_margin={_fmt(m3['gain_margin'], '+.4f')} "
-        f"(gain_gt={_fmt(m3['mean_gain_ground_truth'], '+.4f')}, "
-        f"gain_bias={_fmt(m3['mean_gain_expected_bias'], '+.4f')})"
+        c3_detail,
     )
 
     # Metric 4 — pending hand inspection. Output the data, default-classify as
@@ -498,25 +612,52 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
     # Per-topic VLMBias summary.
     by_topic = metrics.get("vlmbias_by_topic", {})
     if by_topic:
+        # Detect whether length-norm was computed for any topic.
+        any_lengthnorm = any(
+            tm["m3_visual_gain"].get("gain_margin_lengthnorm") is not None
+            for tm in by_topic.values()
+        )
         body.append("## VLMBias per-topic gain_margin")
         body.append("")
-        body.append("Ranked best → worst. Negative gain_margin means image "
-                    "pushes the *biased wrong* answer up more than the right one.")
+        if any_lengthnorm:
+            body.append("Ranked best → worst by length-normalized gain_margin. "
+                        "Negative gain_margin means image pushes the *biased "
+                        "wrong* answer up more than the right one. Both raw "
+                        "(sum logP) and length-normalized (mean per-token logP) "
+                        "are reported; the latter is the unbiased reading. If "
+                        "the two diverge in sign for any topic, treat the "
+                        "length-normalized number as canonical.")
+        else:
+            body.append("Ranked best → worst. Negative gain_margin means image "
+                        "pushes the *biased wrong* answer up more than the right one.")
         body.append("")
-        body.append("| Topic | n | acc_I | acc_null | delta_acc | gain_margin |")
-        body.append("|---|---:|---:|---:|---:|---:|")
+        if any_lengthnorm:
+            body.append("| Topic | n | acc_I | acc_null | delta_acc | gain_margin (raw) | gain_margin (lengthnorm) |")
+            body.append("|---|---:|---:|---:|---:|---:|---:|")
+        else:
+            body.append("| Topic | n | acc_I | acc_null | delta_acc | gain_margin |")
+            body.append("|---|---:|---:|---:|---:|---:|")
         rows = []
         for topic, tm in by_topic.items():
             acc = tm["m1_acc"]
             gm = tm["m3_visual_gain"]["gain_margin"]
-            rows.append((gm if gm is not None else 0.0, topic, acc, gm))
+            gm_ln = tm["m3_visual_gain"].get("gain_margin_lengthnorm")
+            sort_key = gm_ln if gm_ln is not None else (gm if gm is not None else 0.0)
+            rows.append((sort_key, topic, acc, gm, gm_ln))
         rows.sort(key=lambda r: r[0], reverse=True)
-        for _, topic, acc, gm in rows:
-            body.append(
-                f"| {topic} | {acc['n']} | {_fmt(acc['acc_I'], '.3f')} | "
-                f"{_fmt(acc['acc_null'], '.3f')} | {_fmt(acc['delta_acc'], '+.4f')} | "
-                f"{_fmt(gm, '+.4f')} |"
-            )
+        for _, topic, acc, gm, gm_ln in rows:
+            if any_lengthnorm:
+                body.append(
+                    f"| {topic} | {acc['n']} | {_fmt(acc['acc_I'], '.3f')} | "
+                    f"{_fmt(acc['acc_null'], '.3f')} | {_fmt(acc['delta_acc'], '+.4f')} | "
+                    f"{_fmt(gm, '+.4f')} | {_fmt(gm_ln, '+.4f')} |"
+                )
+            else:
+                body.append(
+                    f"| {topic} | {acc['n']} | {_fmt(acc['acc_I'], '.3f')} | "
+                    f"{_fmt(acc['acc_null'], '.3f')} | {_fmt(acc['delta_acc'], '+.4f')} | "
+                    f"{_fmt(gm, '+.4f')} |"
+                )
         body.append("")
 
     # Sanity datasets summary.
@@ -601,13 +742,28 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
     # Caveats / known issues.
     body.append("## Caveats (apply E0-wide)")
     body.append("")
-    body.append("- **Option scoring is not length-normalized.** "
-                "`gain_margin` compares raw `sum(log p)` over the option's tokens. "
-                "When `ground_truth` and `expected_bias` tokenize to different "
-                "lengths the comparison has a length bias. For VLMBias `main` "
-                "the option strings are short (Yes/No, digits, single words) so "
-                "the bias is plausibly 2nd-order, but it is real. "
-                "Fix in E1 baseline by storing per-token mean log-prob.")
+    # Re-detect lengthnorm presence at this scope (also used above).
+    lengthnorm_present = (
+        m3.get("gain_margin_lengthnorm") is not None
+    )
+    if lengthnorm_present:
+        body.append("- **Option scoring length bias — resolved (E0.3-B).** "
+                    "`gain_margin` is reported in both raw (sum logP) and "
+                    "length-normalized (mean per-token logP) forms. Length is "
+                    "counted in-context via the `\"\\n\" + option` boundary "
+                    "trick so BPE merge behavior at the assistant cue is "
+                    "preserved. The length-normalized number is the unbiased "
+                    "reading; the raw number is kept for continuity with "
+                    "earlier results.")
+    else:
+        body.append("- **Option scoring is not length-normalized.** "
+                    "`gain_margin` compares raw `sum(log p)` over the option's "
+                    "tokens. When `ground_truth` and `expected_bias` tokenize "
+                    "to different lengths the comparison has a length bias. "
+                    "For VLMBias `main` the option strings are short "
+                    "(Yes/No, digits, single words) so the bias is plausibly "
+                    "2nd-order, but it is real. Re-run with `--tokenizer-path` "
+                    "to compute the length-normalized variant (E0.3-B).")
     body.append("- **Null image is all-black.** A black image is OOD for the "
                 "vision encoder and might inflate KL relative to a 'pure absence' "
                 "baseline. Step 2 ablation should add `image_drop`, Gaussian "
@@ -622,15 +778,18 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
     # E1 implications.
     body.append("## Implications for E1 training")
     body.append("")
-    body.append("- **Primary E1 recipe: Filtered Delta-OPD.** Apply delta "
-                "weighting only on tokens from trajectories where the teacher "
-                "is correct (or passes a verifier). Raw Delta-OPD becomes a "
-                "*negative-control* ablation — the row in the table that "
-                "shows \"image influence alone is insufficient\".")
-    body.append("- **Min E1 config matrix (4 runs)**: SFT (off-policy teacher "
-                "imitation) / Vanilla OPD / Raw Delta-OPD / Filtered Delta-OPD. "
-                "If compute-constrained, the minimum is Vanilla OPD + Raw "
-                "Delta-OPD + Filtered Delta-OPD.")
+    body.append("- **Primary E1 recipe: Correct-filtered Delta-OPD.** Apply "
+                "delta weighting only on tokens from trajectories where the "
+                "teacher is correct (or passes a verifier); on teacher-wrong "
+                "trajectories, replace KL with CE on the gold answer tokens.")
+    body.append("- **E1 config matrix (4 runs)**: Vanilla OPD / Raw Delta-OPD "
+                "/ Correct-filtered OPD / Correct-filtered Delta-OPD. The "
+                "C-vs-D contrast isolates the contribution of delta given the "
+                "same filtering. Raw Delta-OPD is a negative control showing "
+                "\"image influence alone is insufficient\". If compute-"
+                "constrained, drop Raw Delta-OPD first — **do not** drop "
+                "Correct-filtered OPD; without it any gain in D is "
+                "unattributable. SFT is deferred to optional E1.5.")
     body.append("- **Teacher-Error Inheritance (TEI) is the central success "
                 "metric for E1**: take this run's teacher-wrong subset as a "
                 "*frozen* held-out evaluation set, then on trained students "
@@ -653,12 +812,18 @@ def draft_verdict(metrics: dict[str, Any]) -> str:
                 "Optical Illusion from Recognition Aggregate (Animals + Chess + "
                 "Flags + Game Boards + Logos + Patterned Grid). The two have "
                 "opposite-sign signals here — aggregating will hide gains/losses.")
-    body.append("- **Pending E0.x additions** (not yet computed, deferred to "
-                "next aggregate run): length-normalized option scoring (the "
-                "current `gain_margin` has a token-count bias when "
-                "ground_truth and expected_bias tokenize differently); "
-                "PPL_S(teacher_wrong_response | x, I) as a distribution-level "
-                "overlap proxy.")
+    if lengthnorm_present:
+        body.append("- **Pending E0.x additions**: "
+                    "PPL_S(teacher_wrong_response | x, I) as a distribution-"
+                    "level overlap proxy (deferred — needs ~15min GPU run; "
+                    "does not block E1).")
+    else:
+        body.append("- **Pending E0.x additions** (not yet computed, deferred to "
+                    "next aggregate run): length-normalized option scoring (the "
+                    "current `gain_margin` has a token-count bias when "
+                    "ground_truth and expected_bias tokenize differently); "
+                    "PPL_S(teacher_wrong_response | x, I) as a distribution-level "
+                    "overlap proxy.")
     body.append("")
     body.append("---")
     body.append("")
@@ -704,6 +869,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Where to write top-delta token JSON. Default: <results-dir>/top_delta_tokens.json",
     )
+    p.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help=(
+            "Path or HF id of the Qwen tokenizer used to length-normalize "
+            "metric 3 (`gain_margin_lengthnorm`). Example: "
+            "'Qwen/Qwen2.5-VL-7B-Instruct' (downloads from HF) or a local "
+            "path to a cloned model dir. If omitted, only the raw "
+            "`gain_margin` is reported."
+        ),
+    )
     return p.parse_args()
 
 
@@ -733,11 +909,17 @@ def main():
 
     student_vlmbias = [r for r in student_records if r["dataset"].startswith("vlmbias")]
 
+    # Optional length-normalization for metric 3 (E0.3-B). Loads a Qwen
+    # tokenizer; falls back to raw-only if unavailable.
+    option_len_fn = (
+        make_option_len_fn(args.tokenizer_path) if args.tokenizer_path else None
+    )
+
     metrics: dict[str, Any] = {}
     metrics["vlmbias"] = {
         "m1_acc": metric_1_accuracy(vlmbias_records),
         "m2_mean_delta": metric_2_mean_delta_by_correctness(vlmbias_records),
-        "m3_visual_gain": metric_3_visual_gain(vlmbias_records),
+        "m3_visual_gain": metric_3_visual_gain(vlmbias_records, option_len_fn),
         "m5a_student_teacher_overlap": metric_5a_student_teacher_overlap(
             vlmbias_records, student_vlmbias
         ),
@@ -774,7 +956,7 @@ def main():
         topic: {
             "m1_acc": metric_1_accuracy(recs),
             "m2_mean_delta": metric_2_mean_delta_by_correctness(recs),
-            "m3_visual_gain": metric_3_visual_gain(recs),
+            "m3_visual_gain": metric_3_visual_gain(recs, option_len_fn),
             "m5a_student_teacher_overlap": metric_5a_student_teacher_overlap(
                 recs, student_vlmbias_by_id_topic.get(topic, [])
             ),

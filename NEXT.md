@@ -18,6 +18,28 @@ E2 (mask sensitivity ablation) : not started
 
 ## Right now, today (the literal next thing to do)
 
+0. ✅ **E0.3-B done (2026-05-12).** Length-normalized `gain_margin` added to
+   `metrics.py` (boundary-trick token count via `"\n" + option`). Re-aggregated
+   on existing jsonls with `--tokenizer-path Qwen/Qwen2.5-VL-7B-Instruct`.
+
+   **Result: per-topic direction is stable. No sign flips.**
+   - Topics with same-length option pairs (Optical Illusion, Patterned Grid,
+     Logos, Animals) — numbers unchanged.
+   - Multi-token-option topics (Flags / Chess Pieces / Game Boards) — magnitude
+     shrunk 20–31% but **same sign**: Flags -2.60 → -1.80, Chess -2.80 → -2.09,
+     Game Boards -3.90 → -3.14.
+   - Global: -1.82 → -1.63, still fail.
+
+   **Conclusion: E1 motivation is not a length-bias artifact. No reframing
+   needed. Proceed to E1.**
+
+   Run command to reproduce:
+   ```bash
+   python experiments/E0_image_null_delta/src/metrics.py \
+       --results-dir experiments/E0_image_null_delta/results \
+       --tokenizer-path Qwen/Qwen2.5-VL-7B-Instruct
+   ```
+
 1. **Verify the overnight ViRL39K download on the server.**
 
    ```bash
@@ -60,16 +82,15 @@ E2 (mask sensitivity ablation) : not started
 
 ---
 
-## E0.x — pending diagnostic cleanup (deferred, can do in parallel with E1 setup)
+## E0.x — pending diagnostic cleanup
 
-Priority is **low** — none of these change the Conditional GO verdict. Do them if the eval framework for E1 needs them anyway.
-
-| Task | Cost | Why |
-|---|---|---|
-| **Length-normalized option scoring** | Add Qwen tokenizer load in `metrics.py`; ~30 lines; no rerun needed. | Eliminates length bias in `gain_margin`. Will be reused as-is in E1 eval. |
-| **PPL_S(teacher_wrong_response \| x, I)** | New ~15 min server run; new script `e0_ppl_student.py`. | Distribution-level overlap proxy. More OPD-faithful than answer-overlap. Useful as an E0 baseline before E1 trained students. |
-| **72B teacher sanity** | `bash experiments/E0_image_null_delta/scripts/run_e0_teacher72b_sanity.sh`; ~20 min on 2 H800. | Tells us if the failure modes scale away with larger teacher (probably no) or are property of architecture (probably yes). |
-| **Per-topic top tokens validation** | Hand-inspect `top_delta_tokens.json["vlmbias_by_topic"]`; Logos has anomalous `" on"` token, decide if signal or noise. | Confirms metric 4 quality across topics, not just globally. |
+| Task | Status | Cost | Why |
+|---|---|---|---|
+| **E0.3-A: per-topic m5a + chance-normalized overlap** | ✅ **DONE** (`c9615363`; table in `e0_verdict.md` § Student/teacher overlap) | — | Was needed because global 72.9% same-wrong was a mix of mechanical binary-task ceiling and real shared prior. Now broken out per topic with `excess_over_chance`. |
+| **E0.3-B: Length-normalized `gain_margin`** | ⏳ **Promoted to "Right now, today" item #0** (E1 blocker) | Add Qwen tokenizer load in `metrics.py`; ~30 lines; no rerun needed. | Eliminates length bias in `gain_margin`. **E1 motivation hinges on the per-topic table direction — must verify it survives normalization before training.** Will be reused as-is in E1 eval. |
+| **E0.3-C: PPL_S(teacher_wrong_response \| x, I)** | Deferred, **does not block E1** | New ~15 min server run; new script `e0_ppl_student.py`. | Distribution-level overlap proxy. More OPD-faithful than answer-overlap. Useful as an E0 baseline before E1 trained students. Schedule when GPU is free. |
+| **72B teacher sanity** | Deferred | `bash experiments/E0_image_null_delta/scripts/run_e0_teacher72b_sanity.sh`; ~20 min on 2 H800. | Tells us if the failure modes scale away with larger teacher (probably no) or are property of architecture (probably yes). |
+| **Per-topic top tokens validation** | Deferred | Hand-inspect `top_delta_tokens.json["vlmbias_by_topic"]`; Logos has anomalous `" on"` token, decide if signal or noise. | Confirms metric 4 quality across topics, not just globally. |
 
 ---
 
@@ -81,21 +102,23 @@ Priority is **low** — none of these change the Conditional GO verdict. Do them
 
 | Config | What | Role |
 |---|---|---|
-| A. `sft` | `L = −log p_S(y_T \| x, I)` on teacher outputs | Imitation baseline |
-| B. `vanilla_opd` | Student rollout + teacher reverse-KL full-prefix | Existing-OPD baseline |
-| C. `raw_delta_opd` | `Σ_t delta_t · KL(p_T \|\| p_S)` no filtering | **Negative control** — tests "image influence alone is insufficient" |
-| D. `filtered_delta_opd` | Same as C, but `delta_t` zeroed on teacher-wrong trajectories + CE on gold answer tokens | **Primary candidate** |
+| A. `vanilla_opd` | Student rollout + teacher reverse-KL full-prefix, no filtering, no delta | Existing-OPD baseline |
+| B. `raw_delta_opd` | `Σ_t delta_t · KL(p_T \|\| p_S)`, no filtering | **Negative control** — tests "image influence alone is insufficient" |
+| C. `correct_filtered_opd` | `1[T_correct] · Σ_t KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Critical control** — isolates filtering's contribution. Without this, D's gains could be from filtering alone. |
+| D. `correct_filtered_delta_opd` | `1[T_correct] · Σ_t delta_t · KL(p_T \|\| p_S)`; CE on gold for teacher-wrong | **Primary candidate** — filtering + delta. |
 
-Compute-budget fallback: drop SFT first, keep B+C+D.
+Compute-budget fallback: drop B (Raw Delta-OPD) first, keep A+C+D. **Do NOT drop C** — without the filtering-only control, D's gains are unattributable.
+
+SFT (`L = −log p_S(y_T | x, I)`) is deferred to optional E1.5 — different question, not part of the core method validation.
 
 ### Day-by-day (rough)
 
 | Day | Goal |
 |---|---|
-| **Today (Day 1)** | ViRL39K verified + verl recipe picked + multimodal loader for ViRL39K + outline of `precompute_teacher.py`. |
+| **Today (Day 1)** | E0.3-B done (item #0 above); ViRL39K verified + verl recipe picked + multimodal loader for ViRL39K + outline of `precompute_teacher.py`. |
 | Day 2 | Implement `precompute_teacher.py`; run on a 500-sample slice to sanity-check teacher correctness rate; if <30% correct, ViRL39K isn't the right primary bucket. |
-| Day 3 | Implement SFT trainer (or thin wrapper); smoke-test on 1K samples, 100 steps. |
-| Day 4 | Implement Vanilla OPD; Raw Delta-OPD; Filtered Delta-OPD. Eval hooks. |
+| Day 3 | Implement Vanilla OPD trainer (or thin wrapper); smoke-test on 1K samples, 100 steps. |
+| Day 4 | Implement Raw Delta-OPD + Correct-filtered OPD + Correct-filtered Delta-OPD (shared filtering/CE plumbing — build together). Eval hooks. |
 | Day 5 | Full 4-config sweep on ~8K-sample E1-mini; first eval. |
 | Day 6 | Decide v2 hyperparameters. |
 
@@ -134,20 +157,22 @@ Delta-weighting might amplify object-token attention, which could raise `yes`-ra
 | 2 | Online teacher forward vs precomputed teacher logits? | If memory allows 7B+32B on 8 H800 → online. If not → precompute top-K teacher logits + delta_t per training sample once, cache to disk, replay during training. |
 | 3 | ViRL39K starter subsample size? | 8K for E1-mini. Scale later. |
 | 4 | Where to find adversarial-recognition counterfactuals (NOT VLMBias eval)? | Look at TallyQA, TangramQA, possibly synthesize custom modified-object samples. Decide after Day 1 spike. |
-| 5 | `λ_ans` (CE weight on gold for filtered Delta-OPD when teacher is wrong)? | Start at 1.0 — same scale as KL. Sweep in v2. |
+| 5 | `λ_ans` (CE weight on gold for `correct_filtered_*` configs when teacher is wrong)? | Start at 1.0 — same scale as KL. Sweep in v2. |
 | 6 | Top-K for KL in training (vs E0's 50)? | 50 by default for continuity, but consider 100 to reduce truncation bias. Document the choice. |
 
 ---
 
 ## Hard rules — **DO NOT**
 
-1. **Don't launch training without a recipe decision** (open question #1). You'll waste GPU hours debugging integration.
-2. **Don't generate teacher data on the VLMBias eval set.** That's evaluation, not training. Use held-out adversarial-recognition data only.
-3. **Don't change the null mode** (still only `black`) until E2 ablation. Changing it mid-experiment poisons cross-run comparisons.
-4. **Don't `pip install -e` anything without `--no-deps`** on the server. Rebuilding TransformerEngine costs 30–40 minutes.
-5. **Don't touch `.venv` symlink** on the server.
-6. **Don't share the server** with other tenants during E1 training. Coordinate.
-7. **Don't trust same-wrong overlap rate as a primary signal** — it conflates baseline shared prior with potential distillation effect. Use the TEI metric family instead.
+1. **Don't launch training without E0.3-B done.** If length-normalized `gain_margin` flips the per-topic direction in `e0_verdict.md`, the E1 motivation needs reframing. Cheap local check; do it first.
+2. **Don't launch training without a recipe decision** (open question #1). You'll waste GPU hours debugging integration.
+3. **Don't drop Correct-filtered OPD (Config C) from the 4-config sweep.** Without it, gains in D are unattributable. If compute-constrained, drop Raw Delta-OPD (B) instead.
+4. **Don't generate teacher data on the VLMBias eval set.** That's evaluation, not training. Use held-out adversarial-recognition data only.
+5. **Don't change the null mode** (still only `black`) until E2 ablation. Changing it mid-experiment poisons cross-run comparisons.
+6. **Don't `pip install -e` anything without `--no-deps`** on the server. Rebuilding TransformerEngine costs 30–40 minutes.
+7. **Don't touch `.venv` symlink** on the server.
+8. **Don't share the server** with other tenants during E1 training. Coordinate.
+9. **Don't trust same-wrong overlap rate as a primary signal** — it conflates baseline shared prior with potential distillation effect. Use the TEI metric family instead.
 
 ---
 
