@@ -5,7 +5,8 @@
 > 2. **[`PROGRESS.md`](PROGRESS.md)** — what's been built and what we found so far.
 > 3. **[`NEXT.md`](NEXT.md)** — what to do next, open questions, hard rules.
 > 4. **[`experiments/E0_image_null_delta/results/e0_verdict.md`](experiments/E0_image_null_delta/results/e0_verdict.md)** — the canonical scientific verdict for E0.
-> 5. **[`experiments/E1_filtered_delta_opd/README.md`](experiments/E1_filtered_delta_opd/README.md)** — the design doc for the next experiment phase.
+> 5. **[`experiments/E1_filtered_delta_opd/README.md`](experiments/E1_filtered_delta_opd/README.md)** — the design doc for E1.
+> 6. **[`experiments/E1_filtered_delta_opd/on_policy_v1_design.md`](experiments/E1_filtered_delta_opd/on_policy_v1_design.md)** — the on-policy v1 trainer design (supersedes the off-policy code drafts; see why on-policy is the right method and how the 4-config ablation is set up).
 
 This is the **experiment workspace** for Delta-OPD (on-policy distillation for VLMs guided by per-token image-vs-null teacher delta). It is *not* the verl framework repo; verl is a git submodule at `verl/`.
 
