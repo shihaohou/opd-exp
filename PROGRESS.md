@@ -1,18 +1,19 @@
 # PROGRESS — what has been built and what we found
-*Last updated: 2026-05-12 (evening, end of Day 1). Last commit: `f84fc00b`.*
+*Last updated: 2026-05-13 (after Day 1.5 / Stage 2 v1 smoke). Last commit: `b58932b7`.*
 
-> **For new Claude sessions:** read this file first, then `NEXT.md`, then `CLAUDE.md`. Read the latest `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical E0 findings; read `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` for the canonical E1 training design.
+> **For new Claude sessions:** read this file first, then `NEXT.md`, then `CLAUDE.md`. Read the latest `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical E0 findings; read `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` for the canonical E1 training design. New: read `docs/e1_smoke_runbook.md` if anything in the on-policy trainer breaks at smoke time.
 
 ---
 
 ## TL;DR
 
 - **Project**: Delta-OPD — **on-policy** distillation for VLMs reweighted by per-token image-vs-null teacher KL.
-- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1 complete** — design pivoted to on-policy after external review, ViRL39K loader built and verified, verl FSDP integration spike done, vLLM dual-forward verified end-to-end on Qwen2.5-VL-32B. E1 Stage 2 (on-policy trainer code) is next.
+- **Phase**: E0 **complete** (Conditional GO + E0.3-A/B done). E1 **Day 1.5 / Stage 2 v1 complete** — on-policy trainer code lands and **Config A smoke passes end-to-end**: 12 train steps + validation + checkpoint write on 50 ViRL39K samples. Next is Day 2 (buckets 2 + 3 data builders + dedup + 8K mixture).
 - **E0 verdict**: **Conditional GO**. 3 of 5 primary criteria pass; failures (delta-correctness correlation, gain_margin on VLMBias) are *informative* and constrain E1 method choice.
 - **E0.3-B finding (today)**: Length-normalized `gain_margin` confirms VLMBias per-topic direction is **stable** (no sign flips). Motivation is not a length-bias artifact.
 - **E1 design (locked today)**: On-policy v1. 4 configs A/B/C/D = `VanillaKD` / `RawDeltaKD` / `FilteredKD` / `FilteredDeltaKD`. **C is the critical control** — without it any D > A gain is unattributable to delta. Loss = top-K sparse forward KL on student-rollout prefixes, optionally × normalized `delta_t` × `1[T_correct]` mask, with CE-on-gold branch for teacher-wrong samples.
-- **E1 mixture (locked today, GPT-reviewed)**: 8K E1-mini = 4K ViRL39K (PassRate∈[0.3,0.9], single-image) + 1600 self-built POPE-style on COCO train (NOT official POPE — image leakage) + 2400 (1500 synth VLMBias-like + 900 TallyQA complex). Mandatory dedup pipeline pre-launch.
+- **E1 mixture (locked, GPT-reviewed)**: 8K E1-mini = 4K ViRL39K (PassRate∈[0.3,0.9], single-image) + 1600 self-built POPE-style on COCO train (NOT official POPE — image leakage) + 2400 (1500 synth VLMBias-like + 900 TallyQA complex). Mandatory dedup pipeline pre-launch. Bucket 1 only is built so far; buckets 2/3 are Day 2.
+- **Stage 2 v1 status (Day 1.5)**: all 4 losses, agent-loop manager + worker subclass, parquet builder, launcher → committed. Config A smoke run passed (12 / 12 steps, val OK, checkpoint OK). 5 non-obvious integration traps hit + resolved — written up in `docs/e1_smoke_runbook.md` (NCCL duplicate-GPU from early CUDA init, Hydra `<locals>` qualname, cuDNN v9 sublib load on Conv3d, multimodal prompt-cap + filter mutation bug, missing reward registry).
 - **Headline**: `delta_t` tracks image influence, but the *direction* can be wrong on VLMBias adversarial recognition. **The right E1 recipe is `FilteredDeltaKD` (D)**, with `RawDeltaKD` (B) as negative-control and `FilteredKD` (C) as filtering-only control.
 
 ---
@@ -172,6 +173,70 @@ Multiple GPT review passes converged on the same verdicts as Claude. Genuine val
 
 ---
 
+## E1 — Day 1.5 / Stage 2 v1 (2026-05-12 late → 2026-05-13)
+
+Stage 2 of `on_policy_v1_design.md` (on-policy trainer code) landed and the
+**Config A smoke run passed end-to-end** — Qwen2.5-VL-32B teacher + 7B
+student, 50 ViRL39K samples, 12 train steps + validation + checkpoint
+write. The 4 monitored configs are wired (A/B/C/D); only A has been actually
+exercised on the GPU so far.
+
+### Code built (committed)
+
+| File | Purpose | Status |
+|---|---|---|
+| `experiments/E1_filtered_delta_opd/src/on_policy/agent_loop.py` | `DeltaOPDAgentLoop` (subclass of `SingleTurnAgentLoop`, per-sample KL/CE dispatch) + `DeltaOPDAgentLoopWorker` (overrides `_compute_teacher_logprobs` for dual image+null teacher forward + `delta_t = KL_topK_union(P_T^I, P_T^null)`) + `DeltaOPDAgentLoopManager` (Hydra-instantiable manager that picks our worker subclass). | ✅ |
+| `experiments/E1_filtered_delta_opd/src/on_policy/losses.py` | 4 registered losses: `e1_onpolicy_{vanilla,raw_delta,filtered,filtered_delta}_kd`. Per-sample dispatch via `is_kl`/`is_ce` masks. CE branch = `β · NLL(student | gold)`. Mandatory metrics (`kl_loss_sum` / `ce_loss_sum` / `kl_ce_ratio` / `effective_kl_tokens` / `effective_ce_samples` / `delta_t_*` / per-bucket breakdown). | ✅ Local 6/6 unit tests pass. |
+| `experiments/E1_filtered_delta_opd/src/on_policy/__init__.py` | `enable()` (driver-side) + `install_late_hook()` (compatibility no-op). The Ray worker_process_setup_hook approach was abandoned — see runbook R1. | ✅ |
+| `experiments/E1_filtered_delta_opd/src/on_policy/entrypoint.py` | Driver-side launcher: calls `enable()`, then dispatches to `verl.trainer.main_ppo.main()`. Imports verl deeply only in the driver, where it's safe to init CUDA. | ✅ |
+| `experiments/E1_filtered_delta_opd/src/on_policy/dummy_reward.py` | Always returns `0.0`. verl's agent loop calls `_compute_score` unconditionally even with `use_task_rewards=false`, so we need a stub matching the `compute_score(data_source, solution_str, ground_truth, ...)` signature. | ✅ |
+| `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` | jsonl from `precompute_teacher.py` → parquet. Tokenizes gold via student tokenizer; formats gold response as `"Final answer: \boxed{X}."` (GPT-locked anchor form, not bare `\boxed{}`). Bundles image bytes + bucket + `trajectory_pass` for the agent-loop dispatch. v1 covers ViRL39K bucket only. | ✅ |
+| `experiments/E1_filtered_delta_opd/configs/{e1_base, recipe_A/B/C/D, agent_loop}.yaml` | Hydra config bundle. `e1_base` extends verl's `ppo_trainer` via `hydra.searchpath: [pkg://verl.trainer.config]`. Recipe yamls bake `loss_mode` + `experiment_name`. `agent_loop.yaml` registers `DeltaOPDAgentLoop` as `delta_opd_single_turn`. | ✅ |
+| `experiments/E1_filtered_delta_opd/scripts/run_e1_recipe_smoke.sh` | `bash scripts/run_e1_recipe_smoke.sh A` style launcher. Bakes the non-obvious env defaults (`TORCH_CUDNN_V8_API_DISABLED=1`, `PYTHONPATH=$PWD`, 4+4 GPU split, `num_workers=NGPUS`, multimodal prompt cap). | ✅ |
+| `verl/workers/config/distillation.py` (submodule edit at `2c118243`) | `DistillationLossConfig.__post_init__` now lazy-registers `e1_onpolicy_*` losses. Submodule pointer bumped in `022c465f`. | ✅ |
+| `docs/e1_smoke_runbook.md` | R1-R5: each of the 5 non-obvious integration traps + verification + fix + long-term cleanup. | ✅ |
+
+### Smoke run results (Config A only)
+
+Run command: `bash scripts/run_e1_recipe_smoke.sh A` with `TRAIN_BATCH_SIZE=4`, `MAX_PROMPT_LENGTH=4096`, etc. (the launcher's defaults after this round).
+
+| Stage | Status |
+|---|---|
+| Parquet build (50 ViRL39K samples → `/tmp/e1_smoke.parquet`) | ✅ |
+| Ray cluster init + 4 actor + 4 teacher placement | ✅ |
+| Student FSDP init (was the NCCL Duplicate-GPU failure point) | ✅ after R1 fix |
+| Teacher vLLM (Qwen2.5-VL-32B tp=4) + CUDA graphs capture | ✅ |
+| Agent loop chunking (was failing at batch=4 / num_workers=8) | ✅ after `num_workers=NGPUS` |
+| Rollout + `compute_log_prob` (was the cuDNN sublib fail point) | ✅ after R3 fix |
+| 12 train steps | ✅ |
+| Validation pass | ✅ |
+| Checkpoint write | ✅ |
+| Graceful exit | ⚠️ vLLM/Ray teardown emits noisy errors but exit-0; not blocking |
+
+**B/C/D not yet exercised on GPU.** Code paths are unit-tested locally but the
+dual-forward + delta_t + CE branch are unverified end-to-end.
+
+### Stage 2 design deviations from `on_policy_v1_design.md`
+
+None of substance. Implementation diverged from the design doc only at the
+mechanical level (e.g., late-register vs Ray hook for loss registration —
+the design doc didn't specify a registration mechanism). The math and the
+4-config matrix are exactly as designed.
+
+### What is NOT in Day 1.5 (deferred to Day 2+)
+
+- `data/pope_style_builder.py` — Day 2
+- `data/tallyqa_loader.py` — Day 2
+- `data/synthesize_counterfactuals.py` — Day 2
+- `data/dedup_check.py` — Day 2 (mandatory before any non-smoke launch)
+- `data/mixture.py` — Day 3 (samples 8K E1-mini from the 3 buckets)
+- `src/eval_tei.py` — Day 3-4 (TEI / Escape / per-topic gain_margin + MathVista retention)
+- B / C / D smoke runs on GPU (1 hour each at the smoke scale; cheap, just hasn't been driven yet)
+- Long-term fix for the cuDNN v9 sublib load (LD_LIBRARY_PATH cleanup; runbook R3 "Long-term")
+- Long-term fix for `filter_overlong_prompts` (verl `_build_messages` mutation; runbook R4 "Long-term")
+
+---
+
 ## Pitfalls encountered — keep in mind for any new session
 
 ### Server environment (NGC PyTorch image — `arc-wlf1-ge103-4`)
@@ -241,7 +306,18 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | `0afa00d6` | Add `on_policy_v1_design.md` to new-session reading list. |
 | `eac27504` | E1 spike: vLLM multimodal + `prompt_logprobs=K` verification script. |
 | `5bd282cf` | `docs/migrate-env.md` runbook; `activate.sh` detects triton ldconfig bug (Q5). |
-| **`f84fc00b`** | Fix(spike): raise vLLM `max_logprobs` to match K. **← Day 1 HEAD** |
+| `f84fc00b` | Fix(spike): raise vLLM `max_logprobs` to match K. **← Day 1 HEAD** |
+| `6ebd1e3e` | E1 Stage 2: on-policy v1 trainer (4-config KL/CE dispatch) — initial drop. |
+| `58f34eee` / `58eedbbc` / `7de1225d` | Launcher + Hydra plumbing fixes: shift argv, pkg:// search path, primary-config searchpath. |
+| `69f38dbb` | Widen multimodal prompt cap + disable overlong filter (runbook R4). |
+| `a4d537a0` | 4 actor + 4 teacher default GPU layout. |
+| `5cc8d11c` | `export PYTHONPATH=$PWD` in launcher for Ray-worker module resolution. |
+| `7c9f2bf9` / `49120e1d` | Ray worker registration attempts (later abandoned — see `022c465f`). |
+| `022c465f` | Switch to lazy loss registration in `DistillationLossConfig.__post_init__` + custom agent-loop manager (runbook R1). Bumps verl submodule to `2c118243`. |
+| `73589a43` | `num_workers = NGPUS_PER_NODE` so small-batch smoke doesn't trip the agent-loop chunk assert. |
+| `ba655176` | Dummy `compute_score` for `e1_*` data_sources (runbook R5). |
+| `80e45a6d` | Expose `DeltaOPDAgentLoop` as a module-level `_target_` (runbook R2). |
+| **`b58932b7`** | Default `TORCH_CUDNN_V8_API_DISABLED=1` in launcher (runbook R3). **← Config A smoke passes here.** |
 
 ---
 
@@ -253,13 +329,18 @@ These are noted in `e0_verdict.md` → "Caveats" / "Pending E0.x additions":
 | This file — what's been done | `PROGRESS.md` |
 | What's next, decisions to make | `NEXT.md` |
 | **Environment troubleshooting runbook (Q1-Q5)** | `docs/migrate-env.md` |
+| **E1 smoke integration runbook (R1-R5)** | `docs/e1_smoke_runbook.md` |
 | Canonical E0 verdict | `experiments/E0_image_null_delta/results/e0_verdict.md` |
 | Detailed metric table | `experiments/E0_image_null_delta/results/e0_summary.csv` |
 | Token category data for metric 4 | `experiments/E0_image_null_delta/results/top_delta_tokens.json` |
 | Figures (if matplotlib installed locally) | `experiments/E0_image_null_delta/results/figures/` |
 | E1 design / 4-config matrix / mixture / engineering punch list | `experiments/E1_filtered_delta_opd/README.md` |
-| **E1 on-policy v1 trainer design (canonical for Stage 2)** | `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` |
+| **E1 on-policy v1 trainer design (canonical)** | `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` |
 | E1 bucket-1 loader (ViRL39K) | `experiments/E1_filtered_delta_opd/data/virl39k_loader.py` |
-| E1 offline precompute (smoke + sample-level signals) | `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` |
-| E1 smoke-baseline losses (NOT scientific results) | `experiments/E1_filtered_delta_opd/src/losses.py` |
+| E1 offline precompute (`trajectory_pass` + gold + sample metadata) | `experiments/E1_filtered_delta_opd/src/precompute_teacher.py` |
+| **E1 on-policy v1 trainer code (Stage 2)** | `experiments/E1_filtered_delta_opd/src/on_policy/` |
+| **E1 parquet builder (jsonl → train.parquet)** | `experiments/E1_filtered_delta_opd/data/make_train_parquet.py` |
+| **E1 recipe configs (A/B/C/D)** | `experiments/E1_filtered_delta_opd/configs/recipe_*.yaml` |
+| **E1 smoke launcher** | `experiments/E1_filtered_delta_opd/scripts/run_e1_recipe_smoke.sh` |
+| E1 off-policy smoke-baseline losses (NOT scientific results) | `experiments/E1_filtered_delta_opd/src/losses.py` |
 | vLLM dual-forward verification script | `experiments/E1_filtered_delta_opd/src/spike_vllm_dual_forward.py` |

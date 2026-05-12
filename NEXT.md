@@ -1,93 +1,112 @@
 # NEXT — what to do next
-*Last updated: 2026-05-12 (evening, end of Day 1). Pair this file with `PROGRESS.md`.*
+*Last updated: 2026-05-13 (after Day 1.5 / Stage 2 v1 smoke). Pair this file with `PROGRESS.md`.*
 
-> **For new Claude sessions:** if you're starting fresh, first read `CLAUDE.md`, then `PROGRESS.md` (what we did), then this file. Recommended next concrete action is at **§ Right now, Stage 2** below.
+> **For new Claude sessions:** if you're starting fresh, first read `CLAUDE.md`, then `PROGRESS.md` (what we did), then this file. Recommended next concrete action is at **§ Right now, Day 2** below. If anything in the on-policy trainer breaks at smoke time, also read `docs/e1_smoke_runbook.md`.
 
 ---
 
 ## Status overview
 
 ```
-E0 (forward-only diagnostic)   : DONE — Conditional GO
-E0.3-A (per-topic m5a)         : DONE
-E0.3-B (length-norm gain)      : DONE — per-topic direction stable
-E0.3-C (PPL_S smoke)           : deferred (does not block E1)
-E1 design                      : DONE — locked on-policy v1 with 4 configs A/B/C/D
-E1 Day 1                       : DONE — bucket-1 loader, smoke precompute, verl spike,
-                                  vLLM dual-forward verified, runbook for env Q5
-E1 Stage 2 (on-policy code)    : NEXT — agent_loop subclass + 4 losses + 4 yaml configs
-E2 (mask sensitivity)          : not started
+E0 (forward-only diagnostic)     : DONE — Conditional GO
+E0.3-A (per-topic m5a)           : DONE
+E0.3-B (length-norm gain)        : DONE — per-topic direction stable
+E0.3-C (PPL_S smoke)             : deferred (does not block E1)
+E1 design                        : DONE — locked on-policy v1 with 4 configs A/B/C/D
+E1 Day 1   (loader + spikes)     : DONE
+E1 Day 1.5 (Stage 2 trainer code): DONE — agent_loop + 4 losses + 4 configs + parquet
+                                   builder shipped; Config A smoke passes (12 steps
+                                   + validation + checkpoint on 50 ViRL39K samples)
+E1 Day 2   (buckets 2/3 + dedup) : NEXT
+E1 Day 3+  (mixture + full sweep): pending
+E2 (mask sensitivity)            : not started
 ```
 
 ---
 
-## Right now, Stage 2 (on-policy v1 trainer code)
+## Right now, Day 2 (data — buckets 2 and 3 + dedup + mixture)
 
-Day 1 verified all preconditions. Stage 2 is **writing the on-policy training
-loop**. Estimated 1 full day. **Best done in a fresh Claude session** (this
-session has covered many topic shifts — fresh context for code work).
+Stage 2 trainer code is shipped and the Config A smoke is green. Bucket 1
+(ViRL39K) parquet build also works (`make_train_parquet.py`). The blocker
+for a real E1 sweep is the rest of the 8K mixture.
 
-Read in order before writing code:
-1. `CLAUDE.md` (top 6 reading list — includes on_policy_v1_design.md)
-2. `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` (the **canonical
-   design** for what Stage 2 must build; see § "Engineering path")
-3. `experiments/E1_filtered_delta_opd/README.md` § Configs / Loss specs
+Read in order before starting:
+1. `CLAUDE.md` (top reading list)
+2. `experiments/E1_filtered_delta_opd/README.md` § Training data composition + dedup
+3. `docs/e1_smoke_runbook.md` (if Stage 2 wiring needs touching again — should be stable now)
 
 Concrete deliverables (in suggested order):
 
-1. **`src/on_policy/agent_loop.py`** — subclass `verl.experimental.agent_loop.SingleTurnAgentLoop`,
-   override `_compute_teacher_logprobs` to make TWO teacher calls (image and
-   null, with `multi_modal_data["images"]` swapped) and compute per-token
-   `delta_t = KL_topK(P_T^I || P_T^null)` locally. Reuse E0's
-   `kl_topk_union` for the math. ~120 LoC.
+1. **`data/pope_style_builder.py`** — self-build POPE-style yes/no on COCO
+   `train2017` (NOT the official POPE split — image leakage with POPE-adv eval).
+   ~1.6K samples, balanced yes/no, mixed random/popular/co-occurring negatives.
+   Output: append to a shared jsonl in the same precompute schema so
+   `make_train_parquet.py` can ingest it once it grows beyond ViRL39K.
 
-2. **`src/on_policy/losses.py`** — register 4 on-policy losses with verl's
-   `@register_distillation_loss`:
-   - `e1_onpolicy_vanilla_kd` — `KL_topK(P_T^I || P_S)` (wraps verl's existing
-     `compute_forward_kl_topk`)
-   - `e1_onpolicy_raw_delta_kd` — same × `data["delta_t_normalized"]`
-   - `e1_onpolicy_filtered_kd` — KL branch on `trajectory_pass=1`; CE-on-gold branch on `trajectory_pass=0`
-   - `e1_onpolicy_filtered_delta_kd` — KL × delta on `trajectory_pass=1`; CE-on-gold on `trajectory_pass=0`
+2. **`data/tallyqa_loader.py`** — TallyQA `complex` subset with mandatory
+   COCO image_id filter against POPE-adv eval. Target ~900 samples.
 
-   delta normalization: `clip(delta_t, p95) / mean(clip)` per batch.
-   CE-on-gold dispatch: per-sample branch based on a precompute-time-set
-   `loss_branch` field in the data row ("kl" or "ce"). See
-   on_policy_v1_design.md § 3 and § 6 for the full math.
+3. **`data/synthesize_counterfactuals.py`** — parametric VLMBias-like
+   synthesis (animals leg-count, flags stripe/star, game-board grids, chess
+   counts, patterned-grid count). Target ~1500 samples. All base assets must
+   be NEW (NOT pulled from VLMBias `main` — eval leakage).
 
-3. **`src/on_policy/trainer.py`** — thin wrapper that registers our agent loop
-   + losses, then delegates to verl's FSDP distillation trainer. Loads the
-   precompute parquet + multimodal dataset via `verl.utils.dataset.rl_dataset.RLHFDataset`.
+4. **`data/dedup_check.py`** — three-layer image_id ∩ pHash ∩ CLIP NN check
+   against POPE-adv + VLMBias `main` eval sets. **MUST PASS before any
+   non-smoke launch.**
 
-4. **`configs/recipe_*.yaml`** — 4 YAMLs (one per config). Each overrides:
-   - `distillation.distillation_loss.loss_mode` → one of the 4 registered names
-   - `distillation.distillation_loss.topk` → 50
-   - `distillation.teacher_models.<key>.inference.max_logprobs` → 50 (see
-     spike Q below)
-   - `actor_rollout_ref.rollout.agent_loop_class` → our DeltaOPDAgentLoop
+5. **`data/mixture.py`** — sample the 8K E1-mini from the 3 buckets per the
+   locked recipe (4K ViRL39K + 1.6K POPE-style + 2.4K bucket 3).
 
-5. **`src/on_policy/smoke.sh`** — 1K-subset, 100-step smoke run; confirms
-   rollout → dual teacher → loss → backward → checkpoint cycle.
+6. **Extend `make_train_parquet.py`** to handle the new buckets (currently
+   ViRL39K-only). Each bucket's loader yields the same `Sample` shape; the
+   parquet builder just iterates over all of them.
 
-### Stage 2 prerequisites already satisfied (don't re-spike)
+After Day 2 closes, Day 3 runs the precompute pass on the full 8K mixture
+and launches the 4-config sweep.
 
-- ✅ vLLM multimodal + `prompt_logprobs=K` on Qwen2.5-VL-32B verified
-  (`spike_vllm_dual_forward.py` passed; position-50 in K12-1000-0 showed
-  clean delta signal: image="geometric/triangle" vs null="completely/solid/plain")
-- ✅ verl FSDP distillation has 80% of what we need; subclass agent_loop, no
-  verl source edits required (Spike B)
-- ✅ Triton ldconfig env bug fixed and documented (`docs/migrate-env.md § Q5`);
-  activate.sh detects on future machines
-- ✅ ViRL39K bucket-1 loader DONE and smoke-tested (11,847 eligible rows)
-- ✅ E1 design pivoted to on-policy after external review; 4-config matrix
-  locked as A/B/C/D (VanillaKD / RawDeltaKD / FilteredKD / FilteredDeltaKD)
+### Day 2 dependencies / things you can re-use
 
-### Stage 2 known-issue heads-up
+- **The bucket-loader pattern is already established** by `virl39k_loader.py`
+  — copy its shape (a `Sample` dataclass + an `iter_*()` generator).
+- **`precompute_teacher.py`** already handles arbitrary buckets via the
+  `BUCKET_ITERS` registry — just add new entries when each loader lands.
+- **The parquet schema is locked** by `make_train_parquet.py` (data_source,
+  prompt, images, gold_text, gold_response_text, gold_token_ids,
+  trajectory_pass, bucket). Just plug new buckets in.
+- **Reward function**: `dummy_reward.py` already handles arbitrary
+  `e1_*` data_sources via `data_source.startswith("e1_")` semantics — but
+  currently it returns 0 for everything; if you need a real reward for
+  monitoring (e.g., POPE F1 in training logs) extend it here.
 
-- **`max_logprobs=K` engine arg**: the spike learned that vLLM caps
-  `prompt_logprobs` at 20 by default. Teacher serving config in Stage 2 must
-  also set `max_logprobs=50` (or whatever K we use). Bake into `recipe_*.yaml`.
-- **Triton patch is venv-local** and gets overwritten by triton reinstalls.
-  If `pip install -U triton` runs in Stage 2, re-apply the Q5 sed.
+### Stage 2 verification heads-up (before launching full sweep)
+
+The Config A smoke run only exercised the **vanilla KD** code path. Before
+launching a real run, sanity-check B / C / D each on the 50-sample parquet:
+
+- **B (raw_delta_kd)**: dual teacher forward should run on every sample;
+  expect `e1_v1/delta_t_mean_post_norm ≈ 1.0` in logs (clip-then-rescale
+  normalization is supposed to land there).
+- **C (filtered_kd)**: `e1_v1/effective_ce_samples > 0` (~half the batch
+  on ViRL39K PassRate filter). `e1_v1/kl_ce_ratio` should sit in [0.3, 0.7]
+  — if it drops to ~0, CE dominates and any D > C result is unattributable.
+- **D (filtered_delta_kd)**: both delta_t mean ≈ 1.0 AND `kl_ce_ratio` in
+  a healthy band.
+
+The launcher syntax stays the same; just pass `B`, `C`, `D` instead of `A`.
+
+### Optional cleanups (won't block Day 2/3 but pay dividends later)
+
+- **Long-term R3 fix**: chase the `LD_LIBRARY_PATH` leak from NGC system
+  torch (`/usr/local/lib/python3.12/dist-packages/torch/lib`). Probably
+  filter in `activate.sh`. Until then, `TORCH_CUDNN_V8_API_DISABLED=1` is
+  baked into the launcher.
+- **Long-term R4 fix**: patch `verl/utils/dataset/rl_dataset.py:_build_messages`
+  to not mutate the input image dict in place. Currently sidestepped via
+  `filter_overlong_prompts: false`.
+- **Teardown noise** at end of smoke run (vLLM EngineCore /
+  resource_tracker errors after checkpoint write). Exit-0, not blocking;
+  fix when it interferes with automation.
 
 ---
 
@@ -133,8 +152,9 @@ SFT (`L = −log p_S(y_T | x, I)`) deferred to optional E1.5.
 |---|---|---|
 | **Day 1 (2026-05-12)** | ✅ done | E0.3-B; on-policy pivot; ViRL39K verified + loader; precompute_teacher.py (smoke); losses.py (smoke-baseline only); 3 spikes (verl FSDP, verl on-policy, vLLM dual-forward); env Q5 runbook; on_policy_v1_design.md. |
 | **Day 1.5 (next)** | pending | Stage 2 of on_policy_v1_design.md — agent_loop subclass + losses + 4 yaml configs. Smoke-test on 1K. |
-| Day 2 | pending | Build bucket 2 (POPE-style on COCO train) + bucket 3 (synthesis + TallyQA). Dedup pipeline. Freeze 8K E1-mini mixture. |
-| Day 3 | pending | `make_train_parquet.py`; run precompute on the 8K mixture (sample-level trajectory_pass + gold tokenize only — drop the per-token forced-score path; v1 doesn't use it). |
+| **Day 1.5 (2026-05-12 → 13)** | ✅ done | Stage 2 trainer code: agent_loop + 4 losses + parquet builder + launcher. Config A smoke passes (12 steps + validation + checkpoint on 50 ViRL39K samples). 5 integration traps surfaced + fixed (see `docs/e1_smoke_runbook.md`). `make_train_parquet.py` already written (ViRL39K only). |
+| Day 2 | pending | Build bucket 2 (POPE-style on COCO train) + bucket 3 (synthesis + TallyQA). Dedup pipeline. Freeze 8K E1-mini mixture. Extend `make_train_parquet.py` to multi-bucket. |
+| Day 3 | pending | Run precompute on the 8K mixture (sample-level trajectory_pass + gold tokenize only — drop the per-token forced-score path; v1 doesn't use it). Sanity-check B / C / D smoke runs on the new parquet. |
 | Day 4 | pending | Full 4-config sweep on 8K E1-mini, on-policy. |
 | Day 5 | pending | First eval (TEI / Escape / per-topic gain_margin); decide v2 hyperparameters. |
 
@@ -165,7 +185,7 @@ Delta-weighting might amplify object-token attention, which could raise `yes`-ra
 
 ---
 
-## Open questions — most resolved 2026-05-12; one remaining for Stage 2
+## Open questions — all resolved through Day 1.5
 
 | # | Question | Status |
 |---|---|---|
@@ -173,9 +193,9 @@ Delta-weighting might amplify object-token attention, which could raise `yes`-ra
 | 2 | Online teacher forward vs precomputed | ✅ Resolved. **Online** for per-token `teacher_logp` + `delta_t` (on student rollout prefix, can't precompute). **Precomputed** for sample-level `trajectory_pass` + `gold_token_ids` (precompute_teacher.py output). |
 | 3 | ViRL39K starter subsample size | ✅ 8K E1-mini. Stratified by category from the 11,847 PassRate-filtered single-image rows. |
 | 4 | Adversarial-recognition counterfactual source | ✅ Resolved post-GPT-review: synthesis-primary (~1500 VLMBias-like) + TallyQA complex (~900). NOT VLMBias `withtitle`/`remove_background` (image leakage with `main` eval). |
-| 5 | `β` (CE weight on gold for filtered configs) | Start at 1.0. Sweep in v2. |
-| 6 | Top-K for KL in training | 50 (matches E0). vLLM teacher serving needs `max_logprobs=50` in engine config (spike learning). |
-| **7** | **CE-on-gold dispatch implementation** | **Open for Stage 2.** Trainer-level sub-batch split (route by `loss_branch`) vs in-loss per-sample branching. Per `on_policy_v1_design.md § 6`, precompute pre-bakes `response_token_ids` per sample (teacher's response for KL samples, gold tokens for CE samples) so the loss is just `if data["loss_branch"] == "ce": NLL; else: KL_topK * weights`. |
+| 5 | `β` (CE weight on gold for filtered configs) | ✅ Resolved (GPT review): start at 0.1, sweep 0.05–0.3 in v2. CE acts as "answer anchor", not main signal. Baked into `e1.beta=0.1` in `e1_base.yaml`. |
+| 6 | Top-K for KL in training | ✅ 50 (matches E0). vLLM teacher serving needs `max_logprobs=50` in engine config (spike learning). Baked into `e1_base.yaml`. |
+| 7 | CE-on-gold dispatch implementation | ✅ Resolved per `on_policy_v1_design.md § 6` + GPT review: per-sample branch at the agent-loop level (`DeltaOPDAgentLoop.run()` skips vLLM rollout on CE samples, sets `response_ids=gold_token_ids` directly). Loss layer dispatches via `data["loss_branch"]`. Smoke run only exercised A; B/C/D paths are code-tested but not yet GPU-tested. |
 
 ---
 
@@ -219,7 +239,8 @@ Delta-weighting might amplify object-token attention, which could raise `yes`-ra
 
 1. Open this repo.
 2. Read in order: `CLAUDE.md` → `PROGRESS.md` → `NEXT.md`.
-3. Skim `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical numbers.
-4. Open `experiments/E1_filtered_delta_opd/README.md` for the E1 design.
-5. Check `git log --oneline -10` to confirm where we left off (current HEAD: `c9615363` as of this writing).
-6. Pick up at the next un-checked item in **§ Right now, today** above.
+3. Skim `experiments/E0_image_null_delta/results/e0_verdict.md` for the canonical E0 numbers.
+4. Open `experiments/E1_filtered_delta_opd/README.md` (E1 design) and `experiments/E1_filtered_delta_opd/on_policy_v1_design.md` (Stage 2 trainer).
+5. If touching anything in `src/on_policy/`, scan `docs/e1_smoke_runbook.md` first — R1-R5 are the non-obvious gotchas that the Config A smoke uncovered.
+6. Check `git log --oneline -10` to confirm where we left off (current HEAD: `b58932b7` as of this writing).
+7. Pick up at the next un-checked item in **§ Right now, Day 2** above.
