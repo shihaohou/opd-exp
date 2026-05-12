@@ -1,0 +1,20 @@
+# E1 Config A — VanillaKD (baseline)
+# Loss: Σ_t KL_topK(P_T^I(.|s_t) || P_S(.|s_t)) on student-rollout prefixes.
+# No delta_t weighting, no teacher-correct filtering.
+# Role: existing-OPD baseline we want to beat. See README.md § Configs.
+#
+# Even with this baseline, the dual-forward teacher still runs (cost ~2×
+# vs single-teacher), because the worker patch is global. Loss just ignores
+# the delta_t it produced. Set distillation.teacher_dual_forward=false in a
+# follow-up if you want to skip the null pass for the A baseline only.
+
+defaults:
+  - e1_base
+  - _self_
+
+distillation:
+  distillation_loss:
+    loss_mode: e1_onpolicy_vanilla_kd
+
+trainer:
+  experiment_name: e1_A_vanilla_kd

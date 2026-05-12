@@ -1,0 +1,22 @@
+# E1 Config D — FilteredDeltaKD (primary candidate)
+# Loss (per-sample dispatch):
+#   if T_correct: Σ_t w_t · KL_topK(P_T^I || P_S)
+#   else:         0           ← mask-only in this first cut (CE-on-gold deferred)
+# Role: the actual E1 method under test. Central comparisons:
+#   D vs C — does delta help GIVEN filtering? (the hypothesis)
+#   D vs B — does filtering rescue the raw-delta failure on VLMBias?
+#   D vs A — net gain over the existing-OPD baseline (must clear C's lift first)
+#
+# See on_policy_v1_design.md § 1 for the full per-sample loop and § 5 for
+# the mandatory monitoring metrics (kl_ce_ratio, effective_kl_tokens, etc.).
+
+defaults:
+  - e1_base
+  - _self_
+
+distillation:
+  distillation_loss:
+    loss_mode: e1_onpolicy_filtered_delta_kd
+
+trainer:
+  experiment_name: e1_D_filtered_delta_kd

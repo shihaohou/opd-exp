@@ -1,0 +1,151 @@
+# E1 base config (extends verl's ppo_trainer.yaml).
+#
+# This is NOT a launchable config by itself — it's the shared base the four
+# recipe_*.yaml files extend. The launcher passes the recipe file as
+# --config-name, which composes ppo_trainer (verl) ← e1_base (this) ← recipe.
+#
+# Path interpolation:
+#   - `verl/trainer/config` (below) is resolved relative to the working dir
+#     the launcher is invoked from. Run the launch script from the repo root.
+#   - actor_rollout_ref.model.path / distillation.teacher_models.*.model_path
+#     and data.train_files / data.val_files are MANDATORY (Hydra '???' sentinel);
+#     pass them as CLI overrides or via the wrapper script.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ---------------------------------------------------------------------------
+# Distillation: on-policy v1 with dual-forward teacher (image + null).
+# ---------------------------------------------------------------------------
+distillation:
+  enabled: true
+  # Override on the CLI to match TEACHER_WORLD_SIZE (= teacher tp * num_replicas).
+  n_gpus_per_node: 4
+  nnodes: 1
+  distillation_loss:
+    # loss_mode is set per-recipe (see recipe_*.yaml).
+    loss_mode: ???
+    # K=50 matches E0's per-token delta_t top-K and the spike-verified vLLM cap.
+    topk: 50
+    # On-policy v1 uses forward_kl_topk-style supervised distillation
+    # (back-prop the per-token KL directly), NOT the policy-gradient form.
+    # See on_policy_v1_design.md § 3 for why forward-KL over reverse-KL.
+    use_policy_gradient: false
+    # No reward signal blended in; Delta-OPD is pure distillation.
+    use_task_rewards: false
+    # Clamp KL contributions to keep one runaway token from dominating the
+    # batch. Same values verl's distillation examples use.
+    loss_max_clamp: 10.0
+    log_prob_min_clamp: -10.0
+  teacher_models:
+    teacher_model:
+      # Must be set on the CLI (Qwen2.5-VL-32B-Instruct path on the server).
+      model_path: ???
+      inference:
+        name: vllm
+        # Adjust per teacher_tp; defaults aimed at 4×H800 for Qwen2.5-VL-32B.
+        tensor_model_parallel_size: 4
+        gpu_memory_utilization: 0.45
+        # max_model_len must cover prompt_width + response_width + 1
+        # (set explicitly below to make the math obvious).
+        max_model_len: 5121
+        engine_kwargs:
+          vllm:
+            # Spike learning: vLLM caps prompt_logprobs at max_logprobs.
+            # MUST equal distillation_loss.topk above so SamplingParams(prompt_logprobs=K)
+            # is accepted at engine boot.
+            max_logprobs: 50
+
+# ---------------------------------------------------------------------------
+# Algorithm: standard on-policy KD setup.
+# Distillation supplies the gradient; GRPO-style advantage is unused
+# (use_task_rewards=false above). Choose grpo as a benign placeholder.
+# ---------------------------------------------------------------------------
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+# ---------------------------------------------------------------------------
+# Data (multimodal: image_key=images so RLHFDataset routes PIL images through
+# the rollout / teacher multi_modal_data field).
+# ---------------------------------------------------------------------------
+data:
+  train_files: ???
+  val_files: ???
+  train_batch_size: 64
+  max_prompt_length: 1024
+  max_response_length: 4096
+  filter_overlong_prompts: true
+  truncation: error
+  image_key: images
+  shuffle: true
+
+# ---------------------------------------------------------------------------
+# Actor / Rollout (student = Qwen2.5-VL-7B).
+# ---------------------------------------------------------------------------
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    # Override on CLI (Qwen2.5-VL-7B-Instruct path on the server).
+    path: ???
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1.0e-6
+    ppo_mini_batch_size: 64
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 24576
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 2
+    gpu_memory_utilization: 0.4
+    n: 1
+    max_model_len: 5121
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 24576
+    agent:
+      # Route every sample through Delta-OPD's agent loop. Vanilla rollout is
+      # identical to verl's single_turn_agent; the dual-forward teacher pass
+      # is added by the monkey-patch on AgentLoopWorker._compute_teacher_logprobs.
+      default_agent_loop: delta_opd_single_turn
+      # Path is resolved relative to launcher CWD (the repo root).
+      agent_loop_config_path: experiments/E1_filtered_delta_opd/configs/agent_loop.yaml
+
+# ---------------------------------------------------------------------------
+# Trainer driver.
+# ---------------------------------------------------------------------------
+trainer:
+  project_name: e1_delta_opd
+  # experiment_name is set per-recipe.
+  experiment_name: ???
+  logger: ['console']
+  n_gpus_per_node: 8
+  nnodes: 1
+  val_before_train: false
+  save_freq: 200
+  test_freq: 50
+  total_epochs: 3
+  balance_batch: true
+
+# ---------------------------------------------------------------------------
+# Delta-OPD knobs (read by DeltaOPDAgentLoop / losses.py).
+#
+# - beta: weight on CE-on-gold branch for filtered configs (C/D). 0.1 follows
+#   the GPT-recommended starting range 0.05-0.3 — see on_policy_v1_design.md
+#   § 6 + the May-12 GPT review (CE as "answer anchor", not main signal).
+#
+# apply_pass_filter / need_delta are NOT keys here — they're derived at
+# agent_loop init from the loss_mode name ("filtered" / "delta"), so a
+# recipe yaml only sets loss_mode and the rest follows automatically.
+# ---------------------------------------------------------------------------
+e1:
+  beta: 0.1

@@ -1,0 +1,17 @@
+# E1 Config B — RawDeltaKD (negative control)
+# Loss: Σ_t w_t · KL_topK(P_T^I(.|s_t) || P_S(.|s_t)),
+#       w_t = clip(delta_t, p95) / mean(clip) over valid response tokens.
+# No teacher-correct filtering — delta is applied across all samples.
+# Role: tests whether image-influence weighting alone helps; E0 predicts NO
+# on VLMBias recognition topics (delta is wrong-direction there).
+
+defaults:
+  - e1_base
+  - _self_
+
+distillation:
+  distillation_loss:
+    loss_mode: e1_onpolicy_raw_delta_kd
+
+trainer:
+  experiment_name: e1_B_raw_delta_kd
