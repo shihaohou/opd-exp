@@ -72,6 +72,19 @@ algorithm:
   use_kl_in_reward: false
 
 # ---------------------------------------------------------------------------
+# Reward: dummy (always 0). Distillation drives the gradient
+# (distillation.distillation_loss.use_task_rewards=false above), but verl's
+# AgentLoop still routes each rollout through `_compute_score` → reward fn
+# lookup. Our parquet's `data_source='e1_virl39k'` (etc.) isn't in verl's
+# hardcoded `default_compute_score` registry, so without a custom fn the
+# first rollout crashes with NotImplementedError before any training step
+# happens. The dummy keeps the reward path alive without affecting loss.
+# ---------------------------------------------------------------------------
+custom_reward_function:
+  path: experiments/E1_filtered_delta_opd/src/on_policy/dummy_reward.py
+  name: compute_score
+
+# ---------------------------------------------------------------------------
 # Data (multimodal: image_key=images so RLHFDataset routes PIL images through
 # the rollout / teacher multi_modal_data field).
 # ---------------------------------------------------------------------------
