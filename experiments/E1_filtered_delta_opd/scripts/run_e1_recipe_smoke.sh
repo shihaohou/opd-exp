@@ -33,13 +33,15 @@ E1_STUDENT_MODEL=${E1_STUDENT_MODEL:-$MODELS_ROOT/Qwen2.5-VL-7B-Instruct}
 E1_TEACHER_MODEL=${E1_TEACHER_MODEL:-$MODELS_ROOT/Qwen2.5-VL-32B-Instruct}
 
 # ---- GPU layout (single 8-GPU node) ----
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+# Actor/rollout pool and teacher pool are DISJOINT — they don't share GPUs.
+# Default split for an 8-GPU box: 4 actor + 4 teacher = 8 total.
+# Override NGPUS_PER_NODE / TEACHER_WORLD_SIZE to retune; both must sum to
+# <= the number of GPUs that are actually free on the box.
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 NNODES=${NNODES:-1}
-# Teacher world size = teacher_tp * num_replicas. Defaults: 4 GPUs total for teacher,
-# 4 GPUs for student rollout + actor; tune per recipe.
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-4}
-TEACHER_TP=${TEACHER_TP:-4}
-ROLLOUT_TP=${ROLLOUT_TP:-2}
+TEACHER_TP=${TEACHER_TP:-4}      # single teacher replica, tp=4 inside the teacher pool
+ROLLOUT_TP=${ROLLOUT_TP:-2}      # 2 vLLM rollout replicas inside the actor pool (4 / 2 = 2)
 
 # ---- Batch / length ----
 # Qwen2.5-VL image processor expands each image into ~1000-1500 image_pad
