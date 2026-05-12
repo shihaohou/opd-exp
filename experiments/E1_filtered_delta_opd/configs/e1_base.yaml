@@ -146,26 +146,31 @@ trainer:
   balance_batch: true
 
 # ---------------------------------------------------------------------------
-# Ray runtime env — registers DeltaOPDAgentLoop + 4 losses + worker patch on
-# every Ray worker process.
+# Ray runtime env — install the late hook in every Ray worker.
 #
-# Without this, the registry populated by the driver process (entrypoint.py
-# calling enable()) is invisible to Ray actors (TaskRunner, WorkerDicts),
-# because Ray reimports modules on each worker — module-level state like
-# `DISTILLATION_LOSS_REGISTRY` starts empty. The first time a worker calls
-# `omega_conf_to_dataclass(distillation_config)`, `DistillationLossConfig.
-# __post_init__` looks up `loss_settings = get_distillation_loss_settings
-# (loss_mode)` → ValueError("Unsupported loss mode: e1_onpolicy_vanilla_kd").
+# IMPORTANT: This MUST be `install_late_hook`, NOT `enable`. The worker_process
+# _setup_hook fires at worker process start, *before* Ray assigns a GPU to the
+# actor. `enable()` cascades into `verl.trainer.distillation.losses` which
+# imports `verl.utils.device.get_device_capability()` → triggers
+# `torch.cuda.*` while CUDA_VISIBLE_DEVICES is still unset. Torch caches an
+# 8-GPU view from that init; Ray's later CUDA_VISIBLE_DEVICES='N' has no
+# effect. Result: every actor's `current_device()` is 0, FSDP rank 0..3 all
+# map to physical GPU 0 → NCCL "Duplicate GPU detected" at FSDP setup.
 #
-# `worker_process_setup_hook` is Ray's per-worker init callback: Ray imports
-# the FQDN string at worker start, gets the callable, runs it exactly once.
-# Our `enable()` is idempotent — safe to run in the driver (already happens
-# in entrypoint.py) AND in every worker.
+# `install_late_hook` only imports `verl.workers.config` (a pure-dataclass
+# module with no torch.cuda calls), patches `DistillationLossConfig.
+# __post_init__` to lazy-register our losses on first lookup. The actual
+# heavy verl import (which would init CUDA) happens later, inside the
+# actor's `init_model` → by then Ray has assigned this actor's GPU and
+# CUDA_VISIBLE_DEVICES is correct.
+#
+# Driver-side wiring (`experiments.../entrypoint.py` calling `enable()`)
+# still registers everything immediately for the driver process.
 # ---------------------------------------------------------------------------
 ray_kwargs:
   ray_init:
     runtime_env:
-      worker_process_setup_hook: experiments.E1_filtered_delta_opd.src.on_policy.enable
+      worker_process_setup_hook: experiments.E1_filtered_delta_opd.src.on_policy.install_late_hook
       env_vars:
         # Pin so Ray workers can `import experiments.E1_filtered_delta_opd...`
         # The driver is launched as `python -m ...` from the repo root (so its
