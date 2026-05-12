@@ -13,7 +13,11 @@
 
 hydra:
   searchpath:
-    - file://verl/trainer/config
+    # Load verl's ppo_trainer.yaml as a Python package resource so we don't
+    # depend on launch CWD. Inside the submodule the layout is verl/verl/
+    # trainer/config/, but the Python package import path is verl.trainer.config,
+    # so the pkg:// scheme resolves regardless of where the launcher runs from.
+    - pkg://verl.trainer.config
 
 defaults:
   - ppo_trainer
