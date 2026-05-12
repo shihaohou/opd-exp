@@ -42,10 +42,14 @@ TEACHER_TP=${TEACHER_TP:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 
 # ---- Batch / length ----
+# Qwen2.5-VL image processor expands each image into ~1000-1500 image_pad
+# tokens at default resolution, so the prompt cap MUST leave room for them
+# (the small geo3k example default of 1024 drops every multimodal sample).
+# 4096 prompt + 2048 response covers single-image ViRL39K with headroom.
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
 MAX_NUM_TOKENS=$(( MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1 ))
 
 # ---- Hydra overrides on top of the recipe yaml ----
