@@ -177,16 +177,36 @@ run_one_config() {
     log "[skip] $L train"
   else
     log "[run]  $L train"
-    if E1_TRAIN_PARQUET="$PARQUET_OUT" \
-       E1_VAL_PARQUET="$PARQUET_OUT" \
-       bash "$LAUNCHER" "$L" 2>&1 | tee "$CDIR/logs/train.log"; then
-      :
+    E1_TRAIN_PARQUET="$PARQUET_OUT" \
+    E1_VAL_PARQUET="$PARQUET_OUT" \
+    bash "$LAUNCHER" "$L" 2>&1 | tee "$CDIR/logs/train.log"
+    local LAUNCHER_EXIT=${PIPESTATUS[0]}
+
+    # Check 1: launcher exit code (pipefail preserved via PIPESTATUS).
+    if [ "$LAUNCHER_EXIT" -ne 0 ]; then
+      log "[FAIL] $L train: launcher exited $LAUNCHER_EXIT. Tail of log:"
+      tail -50 "$CDIR/logs/train.log"
+      return 1
     fi
+
+    # Check 2: at least some training steps logged.
     if ! grep -q "training/global_step:" "$CDIR/logs/train.log"; then
       log "[FAIL] $L train produced no steps. Tail of log:"
       tail -50 "$CDIR/logs/train.log"
       return 1
     fi
+
+    # Check 3: no uncaught Traceback / RuntimeError / RayTaskError
+    # (catches mid-train crashes where steps 1..N-1 logged successfully but
+    # step N hit an exception. Old version of the script wrongly marked
+    # these as "train done" and proceeded with bad checkpoints — see the
+    # 4096 vs 4849 prompt-length crash on 2026-05-13.)
+    if grep -qE "RuntimeError|RayTaskError|raise self\._exception" "$CDIR/logs/train.log"; then
+      log "[FAIL] $L train: exception found mid-run. Excerpt:"
+      grep -B 2 -A 8 -E "RuntimeError|RayTaskError" "$CDIR/logs/train.log" | head -40
+      return 1
+    fi
+
     mark_done "$CDIR/.train_done"
     log "[done] $L train"
   fi
